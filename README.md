@@ -30,6 +30,27 @@ idf.py build
 idf.py -p PORT flash monitor
 ```
 
+## GitHub repository setup
+
+This project is ready to be published as a GitHub repository for team collaboration.
+The included helper script can create the remote repo, configure the `origin` remote, push the `main` branch, and apply repository metadata.
+
+```bash
+./create_github_repo.sh
+```
+
+Before running the script, authenticate `gh` locally:
+
+```bash
+gh auth login
+```
+
+If you want to use a personal access token instead, set it securely and authenticate with:
+
+```bash
+gh auth login --with-token < /path/to/token
+```
+
 ## NVS configuration
 
 The modem and emergency route settings are stored in NVS under the `safety` namespace.
