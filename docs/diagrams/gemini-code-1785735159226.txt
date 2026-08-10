@@ -1,0 +1,62 @@
++-----------------------------------+
+                  |            IDLE STATE             |
+                  | Listening for GPIO Trigger/Events |
+                  +-----------------+-----------------+
+                                    |
+                        Button Press (GPIO4 LOW)
+                                    |
+                                    v
+                  +-----------------------------------+
+                  |           SOS INITIATED           |
+                  |  Load NVS Contact List            |
+                  |  API: GeoLinker.whitelist.get(i)  |
+                  +-----------------+-----------------+
+                                    |
+                                    v
++-------------------> +-----------------------------------+
+|                     |     CONFIGURE AUDIO ROUTING       |
+|                     |  Set Routing: AT+CHFA=1           |
+|                     |  Set Volume:  AT+CLVL=90          |
+|                     |  Set Mic Gain: AT+CMIC=0,12       |
+|                     +-----------------+-----------------+
+|                                       |
+|                                       v
+|                     +-----------------------------------+
+|                     |            DIAL TARGET            |
+|                     |  API: GeoLinker.makeCall(target)  |
+|                     |  AT Cmd: ATD+91xxxxxxxxx;         |
+|                     +-----------------+-----------------+
+|                                       |
+|                                       v
+|                     +-----------------------------------+
+|                     |           RINGING STATE           |
+|                     |  Start Timer (Max 20 Seconds)     |
+|                     |  Poll Modem for Call Status       |
+|                     +-----------------+-----------------+
+|                                       |
+|               +-----------------------+-----------------------+
+|               |                                               |
+|      Status: "MO CONNECTED"                         Status: "BUSY" / 
+|        or "CONNECT"                                "NO CARRIER" / Timeout
+|               |                                               |
+|               v                                               v
+|  +--------------------------+                   +---------------------------+
+|  |     CALL CONNECTED       |                   |       CALL FAILED         |
+|  | Re-apply Audio Routing   |                   | Hangup Line: AT+CHUP      |
+|  | Emergency voice talking  |                   | API: GeoLinker.hangupCall()|
+|  | window open              |                   +-------------+-------------+
+|  +------------+-------------+                                 |
+|               |                                               |
+|         User Hangs Up                                         v
+|               |                             Has next Whitelisted Contact?
+|               v                                /                         \
+|  +--------------------------+               [YES]                        [NO]
+|  |       CALL ENDED         |                /                             \
+|  |  AT Cmd: AT+CHUP         |  Advance Contact Index                        \
+|  +------------+-------------+  (i = i + 1)                                   \
+|               |                             /                                 \
+|               +----------------------------+                                   v
+|                                                                 +---------------------------+
+v                                                                 |     SOS CHAIN COMPLETE    |
+                                                                  | Return to IDLE State      |
+                                                                  +---------------------------+

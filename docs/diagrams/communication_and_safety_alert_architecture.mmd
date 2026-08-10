@@ -1,0 +1,31 @@
+flowchart TD
+    A[ESP32 App<br/>app_main()] --> B[FreeRTOS Tasks]
+    B --> C[communication_task]
+    B --> D[safety_manager_task]
+    B --> E[manual_sos_task]
+
+    C --> F[gl868_modem_init()]
+    C --> G[gl868_modem_run_full_diagnostics()]
+    C --> H[gl868_modem_send_test_sms()]
+
+    D --> I[gl868_modem_trigger_emergency()]
+    I --> J[SIM readiness + status checks]
+    I --> K[GPS location query]
+    I --> L[SMS send]
+    I --> M[Emergency call]
+
+    K --> N[AT+CGNSPWR=1]
+    K --> O[AT+CGNSINF]
+
+    L --> P[AT+CMGF=1]
+    L --> Q[AT+CMGS="<number>"]
+    Q --> R[SMS payload + Ctrl-Z]
+
+    M --> S[ATD<number>;]
+    M --> T[log_call_activity_status()]
+    T --> U[AT+CPAS]
+    T --> V[AT+CLCC?]
+
+    F --> W[esp_modem::DTE UART bridge]
+    W --> X[SIM868 modem via UART1]
+    X --> Y[GSM network / cellular tower]

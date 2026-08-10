@@ -1,0 +1,71 @@
+[ Send HTTP Data Log Request ]
+                   API: sendAndGetResponse()
+                               |
+                               v
+               +-------------------------------+
+               |     Set Carrier APN           |
+               |     API: GeoLinker.setAPN()   |
+               +---------------+---------------+
+                               |
+                               v
+               +-------------------------------+
+               |    Attach GPRS Context        |
+               |    API: gsm.attachGPRS()      |
+               |    AT Cmd: AT+CGATT=1         |
+               +---------------+---------------+
+                               |
+                               v
+               +-------------------------------+
+               |    Configure PDP Connection   |
+               |    AT+SAPBR=3,1,"Contype","GPRS"|
+               |    AT+SAPBR=3,1,"APN","airtel.in"|
+               +---------------+---------------+
+                               |
+                               v
+               +-------------------------------+
+               |     Open IP Bearer Context    |
+               |     AT+SAPBR=1,1              |
+               |     (Wait 2-3 sec for IP)     |
+               +---------------+---------------+
+                               |
+                               v
+               +-------------------------------+
+               |     Verify Assigned IP        |
+               |     AT+SAPBR=2,1              |
+               +---------------+---------------+
+                               |
+                               v
+               +-------------------------------+
+               |    Initialize HTTP Service    |
+               |    AT+HTTPINIT                |
+               |    AT+HTTPPARA="CID",1        |
+               |    AT+HTTPPARA="URL","<URL>"  |
+               +---------------+---------------+
+                               |
+                               v
+               +-------------------------------+
+               |   Set Header & Post Data      |
+               |   AT+HTTPPARA="CONTENT",...   |
+               |   AT+HTTPDATA=<len>,10000     |
+               +---------------+---------------+
+                               |
+                               v
+               +-------------------------------+
+               |   Execute HTTP POST Action    |
+               |   AT+HTTPACTION=1             |
+               +---------------+---------------+
+                               |
+                               v
+               +-------------------------------+
+               |   Read Response Data          |
+               |   AT+HTTPREAD                 |
+               |   API: GeoLinker.httpPost()   |
+               +---------------+---------------+
+                               |
+                               v
+               +-------------------------------+
+               |   Close HTTP & Detach GPRS    |
+               |   AT+HTTPTERM                 |
+               |   AT+SAPBR=0,1                |
+               |   API: gsm.detachGPRS()       |
+               +-------------------------------+
