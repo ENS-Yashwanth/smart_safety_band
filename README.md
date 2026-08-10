@@ -18,7 +18,7 @@ The FreeRTOS runtime includes a 20 ms motion/safety loop, event-driven communica
 | Status LED | 47 | Emergency flashes rapidly |
 | SIM868 UART TX / RX | 17 / 18 | 115200 baud |
 | SIM868 power | 42 | Board power-control line |
-| SOS button | 41 by default | Active-low; configurable in `menuconfig` |
+| SOS button | 41 / 4| Active-low; configurable in `menuconfig` |
 | Motion interrupt | 2 by default | Reserved for sensor-driver integration |
 
 ## Build
