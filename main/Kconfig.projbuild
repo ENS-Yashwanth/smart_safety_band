@@ -5,8 +5,7 @@ menu "Smart Safety Band configuration"
         range 0 48
         default 4
         help
-            GPIO wired to the emergency push button. GPIO41 is reserved for the
-            SIM868 power-key line; the reference design uses
+            GPIO wired to the emergency push button. The reference design uses
             an active-low button with the internal pull-up enabled.
 
     config SAFETY_BAND_MOTION_INT_GPIO
@@ -25,11 +24,35 @@ menu "Smart Safety Band configuration"
             available. The real accelerometer is always preferred; only absent
             health/environment modules produce clearly labelled simulated data.
 
-    config SAFETY_BAND_EMERGENCY_NUMBER
-        string "Emergency contact number"
+    config SAFETY_BAND_EMERGENCY_CALL_NUMBER
+        string "Emergency call number"
         default "+916309538622"
         help
-            Phone number for SMS alerts and emergency call routing through the
-            GL868 modem. Update this to your whitelist recipient before flashing.
+            Phone number to dial when an SOS emergency is activated.
+
+    config SAFETY_BAND_EMERGENCY_SMS_NUMBER
+        string "Emergency SMS number(s)"
+        default "+917288973229"
+        help
+            Recipient number for SOS SMS alerts. Separate multiple numbers with
+            commas or semicolons.
+
+    config SAFETY_BAND_GPRS_APN
+        string "GPRS APN"
+        default "iot.com"
+        help
+            APN supplied by the SIM provider. The GeoLinker reference SIM uses iot.com.
+
+    config SAFETY_BAND_GEOLINKER_API_KEY
+        string "GeoLinker API key"
+        default ""
+        help
+            API key created in the CircuitDigest Cloud GeoLinker dashboard.
+
+    config SAFETY_BAND_GEOLINKER_DEVICE_ID
+        string "GeoLinker device ID"
+        default "smart_safety_band"
+        help
+            Device identifier shown in the GeoLinker dashboard.
 
 endmenu

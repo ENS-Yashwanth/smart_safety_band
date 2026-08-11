@@ -16,7 +16,7 @@ This document provides an in-depth technical analysis and system architecture br
 | **SIM868 UART TX** | `GPIO17` | UART1 TX (115200 baud) | Connected to SIM868 RXD |
 | **SIM868 UART RX** | `GPIO18` | UART1 RX (115200 baud) | Connected to SIM868 TXD |
 | **SIM868 Power Control** | `GPIO42` | Push-Pull Output | Hardware power cycle control line |
-| **SOS Push Button** | `GPIO41` | Input w/ Pull-Up (`GPIO_INTR_NEGEDGE`) | Active-Low emergency button interrupt source |
+| **SOS Push Button** | `GPIO4` | Input w/ Pull-Up (`GPIO_INTR_NEGEDGE`) | Active-Low emergency button interrupt source |
 | **Motion Interrupt** | `GPIO2` | Input | Motion sensor interrupt line |
 | **Battery ADC** | `ADC1_CH0` (`GPIO1`) | Analog Input | Battery voltage monitoring |
 
@@ -59,7 +59,7 @@ The firmware utilizes a layered, concurrent, event-driven FreeRTOS architecture 
    - High priority safety event processor. Consumes `safety_event_t` from `s_safety_events` queue.
    - Latches the emergency state (`s_emergency_latched`), sets `BIT_EMERGENCY` in `s_system_events`, notifies `communication_task`, and invokes modem emergency routines.
 3. **`manual_sos_task` (Priority 8, Stack 4KB)**:
-   - Blocked on `s_sos_sem`. When the user presses the SOS button (`GPIO41` interrupt), `sos_isr()` yields the binary semaphore.
+   - Blocked on `s_sos_sem`. When the user presses the SOS button (`GPIO4` interrupt), `sos_isr()` yields the binary semaphore.
    - Publishes `EVENT_MANUAL_SOS` into `s_safety_events`.
 4. **Motion / Sensor Task (Target / Extensible)**:
    - 20 ms period task reading LSM6DSOX/LIS3DH accelerometer data under `s_i2c_mutex` protection.
@@ -70,7 +70,7 @@ The firmware utilizes a layered, concurrent, event-driven FreeRTOS architecture 
 # 3. Emergency Alert Use Cases & Execution Workflows
 
 ### Use Case 1: Manual SOS Trigger
-1. **User Action**: User depresses active-low SOS button on `GPIO41`.
+1. **User Action**: User depresses active-low SOS button on `GPIO4`.
 2. **ISR Level**: `sos_isr()` triggers on negative edge, executes `xSemaphoreGiveFromISR(s_sos_sem)`, performing `portYIELD_FROM_ISR()`.
 3. **Task Level**: `manual_sos_task` unblocks from `s_sos_sem` and calls `publish_event(EVENT_MANUAL_SOS, 0, "SOS button")`.
 4. **Safety Pipeline**: `safety_manager_task` dequeues `EVENT_MANUAL_SOS`.
@@ -228,7 +228,7 @@ stateDiagram-v2
     [*] --> SYSTEM_BOOT : Firmware Entry (app_main)
     
     state SYSTEM_BOOT {
-        [*] --> INIT_PERIPHERALS : Setup GPIO47, GPIO41 (SOS), GPIO42 (Modem Pwr)
+        [*] --> INIT_PERIPHERALS : Setup GPIO47, GPIO4 (SOS), GPIO42 (Modem Pwr)
         INIT_PERIPHERALS --> INIT_I2C_BUS : Config I2C Master (SDA=8, SCL=9)
         INIT_I2C_BUS --> PROBE_SENSORS : Discover LSM6DSOX / LIS3DH / Health / Environment
         PROBE_SENSORS --> CREATE_TASKS : Launch comm_task, safety_task, manual_sos_task

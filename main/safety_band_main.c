@@ -1,5 +1,6 @@
 #include <stdbool.h>
 #include <stdint.h>
+#include <stdio.h>
 #include <string.h>
 
 #include "driver/gpio.h"
@@ -13,18 +14,6 @@
 #include "freertos/semphr.h"
 #include "freertos/task.h"
 #include "gl868_modem.h"
-#include "safety_shared.h"
-#include "communication_task.h"
-#include "safety_manager_task.h"
-#include "manual_sos_task.h"
-#include "sos_panic.h"
-#include "voice_call_task.h"
-#include "sms_alert_task.h"
-#include "emergency_dispatch_task.h"
-#include "live_location_task.h"
-#include "motion_tracker.h"
-#include "gnss_task.h"
-#include "nvs_flash.h"
 
 #ifndef CONFIG_SAFETY_BAND_SOS_GPIO
 #define CONFIG_SAFETY_BAND_SOS_GPIO 4
@@ -48,10 +37,9 @@
 #define SOS_BUTTON_GPIO ((gpio_num_t)CONFIG_SAFETY_BAND_SOS_GPIO)
 #define MOTION_INT_GPIO ((gpio_num_t)CONFIG_SAFETY_BAND_MOTION_INT_GPIO)
 #define I2C_TIMEOUT_MS 100
-#define FALL_DELTA_MG 1800
-#define EVENT_QUEUE_DEPTH 16
-#define TELEMETRY_QUEUE_DEPTH 16
-#define MODEM_BUFFER_SIZE 256
+#define COMMUNICATION_QUEUE_DEPTH 8
+#define GPS_UPDATE_INTERVAL_MS (2 * 60 * 1000)
+#define SOS_DEBOUNCE_MS 60
 
 #define BIT_MODEM_READY BIT0
 #define BIT_EMERGENCY BIT1
@@ -59,9 +47,9 @@
 static const char *TAG = "SMART_SAFETY_BAND_001";
 
 typedef enum { MOTION_NONE, MOTION_LSM6DSOX, MOTION_LIS3DH } motion_sensor_t;
-typedef enum { SAMPLE_MOTION, SAMPLE_HEALTH, SAMPLE_ENVIRONMENT } sample_kind_t;
-typedef struct { sample_kind_t kind; int32_t value1, value2, value3, value4; bool simulated; } telemetry_sample_t;
 typedef struct { int32_t x_mg, y_mg, z_mg, magnitude_mg; } acceleration_sample_t;
+typedef enum { COMM_EVENT_EMERGENCY, COMM_EVENT_GPS_UPLOAD } communication_event_type_t;
+typedef struct { communication_event_type_t type; const char *source; } communication_event_t;
 typedef struct {
     i2c_master_bus_handle_t bus;
     i2c_master_dev_handle_t motion;
@@ -72,30 +60,15 @@ typedef struct {
 
 static sensor_bus_t s_sensors;
 static SemaphoreHandle_t s_i2c_mutex;
-SemaphoreHandle_t s_sos_sem;
-QueueHandle_t s_safety_events;
-QueueHandle_t s_voice_events;
-QueueHandle_t s_sms_events;
-QueueHandle_t s_dispatch_events;
-QueueHandle_t s_telemetry;
-EventGroupHandle_t s_system_events;
-SemaphoreHandle_t s_gnss_mutex;
-gnss_fix_t s_gnss_fix;
-bool s_emergency_latched;
+static SemaphoreHandle_t s_sos_sem;
+static QueueHandle_t s_communication_events;
+static EventGroupHandle_t s_system_events;
 
-void publish_event(safety_event_type_t type, int32_t value, const char *source)
+static void queue_communication_event(communication_event_type_t type, const char *source)
 {
-    safety_event_t event = {.type = type, .value = value, .source = source};
-    if (xQueueSend(s_safety_events, &event, 0) != pdPASS) ESP_LOGW(TAG, "Safety queue full; dropped %s", source);
-}
-
-static __attribute__((unused)) void publish_sample(sample_kind_t kind, int32_t value1, int32_t value2, int32_t value3,
-                           int32_t value4, bool simulated)
-{
-    telemetry_sample_t sample = {.kind = kind, .value1 = value1, .value2 = value2,
-                                 .value3 = value3, .value4 = value4, .simulated = simulated};
-    if (xQueueSend(s_telemetry, &sample, 0) != pdPASS) {
-        ESP_LOGW(TAG, "Telemetry queue full; dropped sample");
+    const communication_event_t event = {.type = type, .source = source};
+    if (xQueueSend(s_communication_events, &event, 0) != pdPASS) {
+        ESP_LOGW(TAG, "Communication queue full; dropped %s", source);
     }
 }
 
@@ -164,6 +137,74 @@ static void init_io(void)
     ESP_ERROR_CHECK(gpio_isr_handler_add(SOS_BUTTON_GPIO, sos_isr, s_sos_sem));
 }
 
+/* The communication task is the only task that calls the modem API. This keeps
+ * ESP-Modem's UART/DTE state serialized while SMS, calls, GPS and HTTP overlap. */
+static void communication_task(void *argument)
+{
+    communication_event_t event;
+    bool modem_ready = false;
+
+    for (;;) {
+        if (!modem_ready) {
+            ESP_LOGI(TAG, "Powering and initializing SIM868 modem");
+            modem_ready = gl868_modem_init();
+            if (modem_ready) {
+                xEventGroupSetBits(s_system_events, BIT_MODEM_READY);
+                ESP_LOGI(TAG, "SIM868 ready for emergency, GPS and GPRS services");
+                ESP_LOGI(TAG, "Boot complete. Emergency SMS recipient(s): %s", gl868_modem_get_emergency_sms_number());
+                ESP_LOGI(TAG, "Boot complete. Emergency call recipient: %s", gl868_modem_get_emergency_call_number());
+            } else {
+                ESP_LOGW(TAG, "SIM868 initialization failed; retrying in 15 seconds");
+                vTaskDelay(pdMS_TO_TICKS(15000));
+                continue;
+            }
+        }
+
+        if (xQueueReceive(s_communication_events, &event, portMAX_DELAY) != pdTRUE) continue;
+        if (event.type == COMM_EVENT_EMERGENCY) {
+            ESP_LOGW(TAG, "SOS emergency received from %s", event.source);
+            gl868_modem_trigger_emergency(event.source, 0);
+        } else if (event.type == COMM_EVENT_GPS_UPLOAD) {
+            double latitude = 0.0;
+            double longitude = 0.0;
+            if (!gl868_modem_get_gps_coordinates(&latitude, &longitude)) {
+                ESP_LOGW(TAG, "No valid GPS fix; GeoLinker upload deferred");
+                continue;
+            }
+            const int battery = gl868_modem_get_battery_percent();
+            if (!gl868_modem_send_geolinker_location(latitude, longitude, battery)) {
+                ESP_LOGW(TAG, "GeoLinker upload failed; it will be retried at the next interval");
+            }
+        }
+    }
+}
+
+/* Schedules two-minute live-location uploads without competing for modem UART. */
+static void gps_task(void *argument)
+{
+    xEventGroupWaitBits(s_system_events, BIT_MODEM_READY, pdFALSE, pdTRUE, portMAX_DELAY);
+    for (;;) {
+        queue_communication_event(COMM_EVENT_GPS_UPLOAD, "two-minute GPS update");
+        vTaskDelay(pdMS_TO_TICKS(GPS_UPDATE_INTERVAL_MS));
+    }
+}
+
+static void sos_button_task(void *argument)
+{
+    for (;;) {
+        xSemaphoreTake(s_sos_sem, portMAX_DELAY);
+        if (gpio_get_level(SOS_BUTTON_GPIO) != 0) continue;
+        vTaskDelay(pdMS_TO_TICKS(SOS_DEBOUNCE_MS));
+        if (gpio_get_level(SOS_BUTTON_GPIO) == 0) {
+            ESP_LOGW(TAG, "SOS button pressed; sending emergency SMS and call");
+            queue_communication_event(COMM_EVENT_EMERGENCY, "SOS button");
+            while (gpio_get_level(SOS_BUTTON_GPIO) == 0) {
+                xSemaphoreTake(s_sos_sem, pdMS_TO_TICKS(100));
+            }
+        }
+    }
+}
+
 static uint32_t integer_sqrt(uint32_t value)
 {
     uint32_t result = 0;
@@ -213,44 +254,13 @@ int32_t get_motion_magnitude_mg(void)
 
 void app_main(void)
 {
-    esp_err_t err = nvs_flash_init();
-    if (err == ESP_ERR_NVS_NO_FREE_PAGES || err == ESP_ERR_NVS_NEW_VERSION_FOUND) {
-        ESP_ERROR_CHECK(nvs_flash_erase());
-        err = nvs_flash_init();
-    }
-    ESP_ERROR_CHECK(err);
-
     s_i2c_mutex = xSemaphoreCreateMutex(); 
     s_sos_sem = xSemaphoreCreateBinary();
-    s_safety_events = xQueueCreate(EVENT_QUEUE_DEPTH, sizeof(safety_event_t));
-    s_voice_events = xQueueCreate(EVENT_QUEUE_DEPTH, sizeof(safety_event_t));
-    s_sms_events = xQueueCreate(EVENT_QUEUE_DEPTH, sizeof(safety_event_t));
-    s_dispatch_events = xQueueCreate(EVENT_QUEUE_DEPTH, sizeof(safety_event_t));
-    s_telemetry = xQueueCreate(TELEMETRY_QUEUE_DEPTH, sizeof(telemetry_sample_t));
+    s_communication_events = xQueueCreate(COMMUNICATION_QUEUE_DEPTH, sizeof(communication_event_t));
     s_system_events = xEventGroupCreate();
-    s_gnss_mutex = xSemaphoreCreateMutex();
-    configASSERT(s_i2c_mutex && s_sos_sem && s_safety_events && s_voice_events && s_sms_events && s_dispatch_events && s_telemetry && s_system_events && s_gnss_mutex);
-    memset(&s_gnss_fix, 0, sizeof(s_gnss_fix));
+    configASSERT(s_i2c_mutex && s_sos_sem && s_communication_events && s_system_events);
     init_io();
-
-    /* Boot diagnostics: log resolved emergency SMS and call recipients */
-    {
-        const char *diag_sms = gl868_modem_get_emergency_sms_number();
-        const char *diag_call = gl868_modem_get_emergency_call_number();
-        ESP_LOGI(TAG, "Boot diag - emergency SMS recipients: %s", diag_sms ? diag_sms : "(none)");
-        ESP_LOGI(TAG, "Boot diag - emergency CALL number: %s", diag_call ? diag_call : "(none)");
-    }
-
-    TaskHandle_t comm = communication_start();
-    safety_manager_start(comm);
-    manual_sos_start(comm);
-    /* manual_sos_task is the sole SOS-button consumer; it dispatches the SMS
-     * and voice workers through safety_manager_task. */
-    voice_call_task_start();
-    sms_alert_task_start();
-    emergency_dispatch_task_start();
-    live_location_task_start();
-    gnss_task_start();
-    motion_tracker_start();
-    publish_event(EVENT_BOOT, 0, "system");
+    xTaskCreate(communication_task, "communication", 6144, NULL, 10, NULL);
+    xTaskCreate(sos_button_task, "sos_button", 2048, NULL, 8, NULL);
+    xTaskCreate(gps_task, "gps_upload", 2048, NULL, 4, NULL);
 }

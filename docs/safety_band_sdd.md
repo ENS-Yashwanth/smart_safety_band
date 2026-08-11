@@ -184,7 +184,7 @@ The current repository structure maps to this architecture as follows:
 | I2C SDA | GPIO8 | Used by LIS3DH |
 | I2C SCL | GPIO9 | Used by LIS3DH |
 | Motion interrupt | GPIO2 | Reserved for sensor-driver interrupt integration |
-| SOS push button | GPIO41 default | Active-low; configurable in menuconfig |
+| SOS push button | GPIO4 default | Active-low; configurable in menuconfig |
 | Status LED | GPIO47 | Toggle-based activity indicator |
 | Battery ADC | ADC_CHANNEL_0 / GPIO1 | Analog battery sensing |
 | Modem TX | GPIO17 | UART1 TX |
@@ -529,11 +529,4 @@ The present design is intentionally modular so that the following enhancements c
 ---
 
 # Summary
-The Smart Safety Band firmware is currently focused on local emergency response and GSM modem management. The current implementation demonstrates:
-- dynamic emergency contact configuration via NVS
-- on-demand SIM868 modem power gating and initialization
-- SMS and voice emergency dispatch routing
-- live-location SMS fallback during active emergencies
-- task-based safety event handling and GNSS acquisition
-
-This document captures the architecture and design decisions for the present firmware state and the next step toward a production-ready safety device. Cloud telemetry remains a future enhancement rather than part of the current firmware branch.
+The Smart Safety Band firmware is currently at an early but structured stage of implementation. The existing ESP-IDF project already demonstrates the core building blocks of an embedded safety system: sensor access, ADC measurement, GPIO control, and modem diagnostics. The design in this document establishes a professional path forward by introducing a realistic task architecture, synchronization strategy, resource mapping, and modular software organization suitable for further development into a production-ready safety device.
