@@ -44,7 +44,7 @@
 #define MODEM_UART UART_NUM_1
 #define MODEM_TX_GPIO GPIO_NUM_17
 #define MODEM_RX_GPIO GPIO_NUM_18
-#define MODEM_POWER_GPIO GPIO_NUM_41
+#define MODEM_POWER_GPIO GPIO_NUM_42
 #define SOS_BUTTON_GPIO ((gpio_num_t)CONFIG_SAFETY_BAND_SOS_GPIO)
 #define MOTION_INT_GPIO ((gpio_num_t)CONFIG_SAFETY_BAND_MOTION_INT_GPIO)
 #define I2C_TIMEOUT_MS 100
@@ -232,6 +232,15 @@ void app_main(void)
     configASSERT(s_i2c_mutex && s_sos_sem && s_safety_events && s_voice_events && s_sms_events && s_dispatch_events && s_telemetry && s_system_events && s_gnss_mutex);
     memset(&s_gnss_fix, 0, sizeof(s_gnss_fix));
     init_io();
+
+    /* Boot diagnostics: log resolved emergency SMS and call recipients */
+    {
+        const char *diag_sms = gl868_modem_get_emergency_sms_number();
+        const char *diag_call = gl868_modem_get_emergency_call_number();
+        ESP_LOGI(TAG, "Boot diag - emergency SMS recipients: %s", diag_sms ? diag_sms : "(none)");
+        ESP_LOGI(TAG, "Boot diag - emergency CALL number: %s", diag_call ? diag_call : "(none)");
+    }
+
     TaskHandle_t comm = communication_start();
     safety_manager_start(comm);
     manual_sos_start(comm);

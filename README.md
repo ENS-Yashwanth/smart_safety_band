@@ -30,6 +30,28 @@ idf.py build
 idf.py -p PORT flash monitor
 ```
 
+## Enabling PPP (modem data / PPPoS)
+
+If you want the SIM868 modem to provide a PPP data connection (PPPoS) for cloud telemetry, enable PPP support in the build configuration.
+
+- Option A: enable at build-time using `menuconfig`:
+
+```bash
+idf.py menuconfig
+# Navigate to: Component config -> esp-modem / LWIP -> Enable PPP support (LWIP PPP)
+idf.py reconfigure build
+```
+
+- Option B: enable in `sdkconfig.defaults` (already provided in this project) by setting:
+
+```
+CONFIG_LWIP_PPP_SUPPORT=y
+CONFIG_PPP_SUPPORT=y
+```
+
+After enabling PPP, rebuild and flash as usual.
+
+
 ## GitHub repository setup
 
 This project is ready to be published as a GitHub repository for team collaboration.

@@ -31,8 +31,8 @@
 
 static const char *TAG = "sim868_bridge";
 static const char *DEFAULT_MODEM_APN = "internet";
-static const gpio_num_t DEFAULT_MODEM_POWER_GPIO = GPIO_NUM_41;
-static const uint32_t MODEM_STATUS_POLL_MS = 10000;
+static const gpio_num_t DEFAULT_MODEM_POWER_GPIO = GPIO_NUM_42;
+static const uint32_t MODEM_STATUS_POLL_MS = 60000;
 
 namespace {
 static const char *DEFAULT_EMERGENCY_CALL_NUMBER = "+916309538622";
@@ -54,6 +54,7 @@ static const char *DEFAULT_EMERGENCY_SMS_NUMBER = "+917288973229";
         bool initialized = false;
         bool gps_enabled = false;
         bool network_ready = false;
+        bool live_signal_logged = false;
         ModemState state = MODEM_STATE_POWERED_ON;
         TickType_t next_action_tick = 0;
         uint32_t reconnect_delay_ms = 1000;
@@ -61,6 +62,9 @@ static const char *DEFAULT_EMERGENCY_SMS_NUMBER = "+917288973229";
 
     static Sim868State s_state;
     static SemaphoreHandle_t s_modem_mutex;
+    static int s_last_csq_rssi = -1;
+    static int s_last_csq_ber = -1;
+    static int s_csq_poll_count = 0;
 
     class ModemLock {
     public:
@@ -103,10 +107,11 @@ static void shutdown_modem(void)
 
     if (s_state.dte) {
         std::string response;
-        if (send_at_command("AT+CPOWD=1\r", &response, 5000)) {
+        if (send_at_command("AT+CPOWD=1\r", &response, 5000, "NORMAL POWER DOWN")) {
             ESP_LOGI(TAG, "Modem powered down gracefully");
         } else {
-            ESP_LOGW(TAG, "Graceful modem shutdown failed; forcing power-cycle");
+            ESP_LOGW(TAG, "Graceful modem shutdown failed; forcing power-cycle; response=%s", trim_response(response).c_str());
+            s_state.dte.reset();
             power_cycle_modem();
         }
     } else {
@@ -239,11 +244,25 @@ static bool monitor_signal(void)
     std::string response;
     bool any_ok = false;
     if (send_at_command("AT+CESQ\r", &response, 5000)) {
-        ESP_LOGI(TAG, "Signal metrics CESQ: %s", trim_response(response).c_str());
+        ESP_LOGD(TAG, "Signal metrics CESQ: %s", trim_response(response).c_str());
         any_ok = true;
     }
     if (send_at_command("AT+CSQ\r", &response, 5000)) {
-        ESP_LOGI(TAG, "Signal quality CSQ: %s", trim_response(response).c_str());
+        const std::string t = trim_response(response);
+        int rssi = -1, ber = -1;
+        if (sscanf(t.c_str(), "+CSQ: %d,%d", &rssi, &ber) >= 1) {
+            ++s_csq_poll_count;
+            bool changed = (rssi != s_last_csq_rssi) || (ber != s_last_csq_ber);
+            if (s_csq_poll_count == 1 || changed) {
+                ESP_LOGI(TAG, "Signal quality CSQ: %s", t.c_str());
+                s_last_csq_rssi = rssi;
+                s_last_csq_ber = ber;
+            } else {
+                ESP_LOGD(TAG, "Signal quality unchanged: %s", t.c_str());
+            }
+        } else {
+            ESP_LOGW(TAG, "Unexpected CSQ response: %s", t.c_str());
+        }
         any_ok = true;
     }
     return any_ok;
@@ -781,6 +800,9 @@ extern "C" bool gl868_modem_init(void)
     s_state.network_ready = false;
     s_state.initialized = true;
     ESP_LOGI(TAG, "SIM868 modem bridge initialized (GPS=%d)", s_state.gps_enabled);
+    /* Log resolved emergency recipients so they appear whenever modem (re)initializes */
+    ESP_LOGI(TAG, "Resolved emergency SMS recipients: %s", get_emergency_sms_number());
+    ESP_LOGI(TAG, "Resolved emergency CALL number: %s", get_emergency_call_number());
     return true;
 }
 
@@ -840,6 +862,7 @@ extern "C" void gl868_modem_update(void)
         if (poll_network_registration(&registration_status)) {
             ESP_LOGI(TAG, "Network registration achieved: %s", registration_status.c_str());
             s_state.network_ready = init_network_stack();
+            s_state.live_signal_logged = false;
             s_state.state = MODEM_STATE_LIVE;
             s_state.next_action_tick = now + pdMS_TO_TICKS(MODEM_STATUS_POLL_MS);
         } else {
@@ -849,7 +872,11 @@ extern "C" void gl868_modem_update(void)
         break;
     }
     case MODEM_STATE_LIVE: {
-        monitor_signal();
+        if (!s_state.live_signal_logged) {
+            monitor_signal();
+            s_state.live_signal_logged = true;
+        }
+
         std::string registration_status;
         if (!poll_network_registration(&registration_status)) {
             ESP_LOGW(TAG, "Network attach dropped, reconnecting: %s", registration_status.c_str());
