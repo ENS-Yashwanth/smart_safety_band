@@ -1,4 +1,4 @@
-# Smart Safety Band firmware
+# Smart Safety Band Firmware
 
 ESP-IDF / FreeRTOS firmware for an ESP32-S3 Mini-1 based GeoLinker GL868 safety band. It provides a safety-event pipeline, manual SOS handling, fall detection with LSM6DSOX (and legacy LIS3DH support), and a dedicated SIM868 communication bridge for SMS and voice emergency dispatch.
 
