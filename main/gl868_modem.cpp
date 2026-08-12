@@ -15,13 +15,15 @@
 #include "cxx_include/esp_modem_api.hpp"
 #include "cxx_include/esp_modem_dte.hpp"
 #include "cxx_include/esp_modem_types.hpp"
+#include "gl868_modem.h"
 
 static const char *TAG = "sim868_bridge";
 
 namespace {
 static const char *DEFAULT_EMERGENCY_CALL_NUMBER = "+916309538622";
-static const char *DEFAULT_EMERGENCY_SMS_NUMBER = "+917288973229";
-static const char *GEOLINKER_URL = "http://www.circuitdigest.cloud/api/v1/geolinker";
+static const char *DEFAULT_EMERGENCY_SMS_NUMBER = "+916309538622";
+static const uint32_t GPS_FIX_RETRY_DELAY_MS = 5000;
+static const int GPS_FIX_RETRY_COUNT = 2;
 
 struct Sim868State {
     std::shared_ptr<esp_modem::DTE> dte;
@@ -30,6 +32,8 @@ struct Sim868State {
 };
 
 static Sim868State s_state;
+
+struct GpsFixInfo;
 
 static std::string trim_response(const std::string &input)
 {
@@ -40,6 +44,20 @@ static std::string trim_response(const std::string &input)
     }
     const size_t end = input.find_last_not_of(whitespace);
     return input.substr(start, end - start + 1);
+}
+
+static std::string flatten_response(const std::string &input)
+{
+    std::string out;
+    out.reserve(input.size());
+    for (char c : input) {
+        if (c == '\r' || c == '\n') {
+            out.push_back(' ');
+        } else {
+            out.push_back(c);
+        }
+    }
+    return trim_response(out);
 }
 
 static void power_cycle_modem()
@@ -57,9 +75,12 @@ static void log_call_activity_status(void);
 static const char *get_emergency_call_number(void);
 static const char *get_emergency_sms_number(void);
 static std::vector<std::string> split_recipients(const std::string &list);
-static bool send_geolinker_location(double lat, double lon, int battery_percent);
 static bool run_at_step(const char *label, const std::string &command, uint32_t timeout_ms, const char *success_marker = nullptr);
-static void close_geolinker_session(bool http_initialized, bool bearer_open);
+static bool enable_gps(void);
+static bool get_gps_location(std::string *response, uint32_t timeout_ms = 5000);
+static bool is_valid_coordinate(double latitude, double longitude);
+static bool wait_for_sim_ready(uint32_t timeout_ms = 15000);
+static bool ensure_apn_configured(void);
 
 static std::string gps_status_line(const std::string &response)
 {
@@ -69,16 +90,7 @@ static std::string gps_status_line(const std::string &response)
     return trim_response(response.substr(start, end == std::string::npos ? std::string::npos : end - start));
 }
 
-static const char *get_gprs_apn(void)
-{
-#ifdef CONFIG_SAFETY_BAND_GPRS_APN
-    return CONFIG_SAFETY_BAND_GPRS_APN[0] != '\0' ? CONFIG_SAFETY_BAND_GPRS_APN : "iot.com";
-#else
-    return "iot.com";
-#endif
-}
-
-static const char *get_geolinker_api_key(void)
+static __attribute__((unused)) const char *get_geolinker_api_key(void)
 {
 #ifdef CONFIG_SAFETY_BAND_GEOLINKER_API_KEY
     return CONFIG_SAFETY_BAND_GEOLINKER_API_KEY;
@@ -87,7 +99,7 @@ static const char *get_geolinker_api_key(void)
 #endif
 }
 
-static const char *get_geolinker_device_id(void)
+static __attribute__((unused)) const char *get_geolinker_device_id(void)
 {
 #ifdef CONFIG_SAFETY_BAND_GEOLINKER_DEVICE_ID
     return CONFIG_SAFETY_BAND_GEOLINKER_DEVICE_ID[0] != '\0' ? CONFIG_SAFETY_BAND_GEOLINKER_DEVICE_ID : "smart_safety_band";
@@ -106,6 +118,54 @@ static bool is_sim_ready(std::string *out_status = nullptr)
     const std::string trimmed = trim_response(response);
     if (out_status) *out_status = trimmed;
     return trimmed.find("READY") != std::string::npos;
+}
+
+static bool wait_for_sim_ready(uint32_t timeout_ms)
+{
+    const TickType_t deadline = xTaskGetTickCount() + pdMS_TO_TICKS(timeout_ms);
+    std::string sim_status;
+    while (xTaskGetTickCount() < deadline) {
+        if (is_sim_ready(&sim_status)) {
+            ESP_LOGI(TAG, "SIM card ready: %s", sim_status.c_str());
+            return true;
+        }
+        ESP_LOGW(TAG, "SIM not ready: %s; retrying", sim_status.c_str());
+        vTaskDelay(pdMS_TO_TICKS(2000));
+    }
+    ESP_LOGW(TAG, "SIM readiness timeout: %s", sim_status.c_str());
+    return false;
+}
+
+static bool ensure_apn_configured(void)
+{
+#ifdef CONFIG_SAFETY_BAND_GPRS_APN
+    const char *apn = CONFIG_SAFETY_BAND_GPRS_APN;
+    if (apn == nullptr || apn[0] == '\0') {
+        ESP_LOGW(TAG, "No APN configured in sdkconfig; set SAFETY_BAND_GPRS_APN");
+        return false;
+    }
+
+    std::string response;
+    if (send_at_command("AT+CGDCONT?\r", &response, 5000)) {
+        if (response.find(apn) != std::string::npos) {
+            ESP_LOGI(TAG, "APN already configured: %s", apn);
+            return true;
+        }
+    } else {
+        ESP_LOGW(TAG, "Failed to query configured PDP contexts");
+    }
+
+    const std::string command = std::string("AT+CGDCONT=1,\"IP\",\"") + apn + "\"\r";
+    if (!send_at_command(command, &response, 5000)) {
+        ESP_LOGW(TAG, "APN configuration failed: %s", trim_response(response).c_str());
+        return false;
+    }
+    ESP_LOGI(TAG, "APN configured: %s", apn);
+    return true;
+#else
+    ESP_LOGW(TAG, "No APN configured in sdkconfig; set SAFETY_BAND_GPRS_APN");
+    return false;
+#endif
 }
 
 bool send_at_command(const std::string &cmd, std::string *response, uint32_t timeout_ms, const char *success_marker)
@@ -162,11 +222,9 @@ static const char *get_emergency_call_number(void)
 
 static const char *get_emergency_sms_number(void)
 {
-#ifdef CONFIG_SAFETY_BAND_EMERGENCY_SMS_NUMBER
-    return CONFIG_SAFETY_BAND_EMERGENCY_SMS_NUMBER[0] != '\0' ? CONFIG_SAFETY_BAND_EMERGENCY_SMS_NUMBER : DEFAULT_EMERGENCY_SMS_NUMBER;
-#else
+    /* Force emergency SMS recipient to the hard-coded emergency SMS number.
+     * Do not honor runtime or build-time SMS overrides for emergency alerts. */
     return DEFAULT_EMERGENCY_SMS_NUMBER;
-#endif
 }
 
 static std::vector<std::string> split_recipients(const std::string &list)
@@ -191,6 +249,7 @@ static std::vector<std::string> split_recipients(const std::string &list)
 
 struct GpsFixInfo {
     bool valid = false;
+    int run_status = -1;
     int fix_status = -1;
     int fix_mode = -1;
     double latitude = 0.0;
@@ -198,6 +257,7 @@ struct GpsFixInfo {
     double hdop = -1.0;
     int satellites_in_view = -1;
     int satellites_used = -1;
+    std::string timestamp;
 };
 
 static bool parse_gps_fix_info_from_cgnsinf(const std::string &cgnsinf, GpsFixInfo &info)
@@ -220,16 +280,23 @@ static bool parse_gps_fix_info_from_cgnsinf(const std::string &cgnsinf, GpsFixIn
         s = p + 1;
     }
 
-    if (fields.size() < 5) return false;
+    if (fields.size() < 3) return false;
+    info.run_status = static_cast<int>(strtol(fields[0].c_str(), nullptr, 10));
     info.fix_status = static_cast<int>(strtol(fields[1].c_str(), nullptr, 10));
-    if (info.fix_status <= 0) return false;
+    info.timestamp = fields[2];
 
+    if (info.fix_status <= 0) {
+        info.valid = false;
+        return true;
+    }
+
+    if (fields.size() < 5) return false;
     char *endptr = nullptr;
     info.latitude = strtod(fields[3].c_str(), &endptr);
     if (endptr == fields[3].c_str()) return false;
     info.longitude = strtod(fields[4].c_str(), &endptr);
     if (endptr == fields[4].c_str()) return false;
-    if (info.latitude < -90.0 || info.latitude > 90.0 || info.longitude < -180.0 || info.longitude > 180.0) {
+    if (!is_valid_coordinate(info.latitude, info.longitude)) {
         return false;
     }
 
@@ -248,6 +315,91 @@ static bool parse_gps_fix_info_from_cgnsinf(const std::string &cgnsinf, GpsFixIn
     }
     info.valid = true;
     return true;
+}
+
+static bool is_valid_coordinate(double latitude, double longitude)
+{
+    if (latitude == 0.0 && longitude == 0.0) {
+        return false;
+    }
+    if (latitude < -90.0 || latitude > 90.0) {
+        return false;
+    }
+    if (longitude < -180.0 || longitude > 180.0) {
+        return false;
+    }
+    return true;
+}
+
+static bool wait_for_gps_fix(GpsFixInfo &info, uint32_t timeout_ms)
+{
+    if (!s_state.gps_enabled && !enable_gps()) {
+        ESP_LOGW(TAG, "GPS power enable failed before fix attempt");
+        return false;
+    }
+
+    const TickType_t deadline = xTaskGetTickCount() + pdMS_TO_TICKS(timeout_ms);
+    std::string first_timestamp;
+    int last_run_status = -1;
+    int last_fix_status = -1;
+    std::string last_timestamp;
+    while (xTaskGetTickCount() < deadline) {
+        std::string gps_response;
+        if (!get_gps_location(&gps_response, 5000)) {
+            ESP_LOGI(TAG, "GPS query failed during fix wait: %s", gps_status_line(gps_response).c_str());
+            vTaskDelay(pdMS_TO_TICKS(1000));
+            continue;
+        }
+
+        if (!parse_gps_fix_info_from_cgnsinf(gps_response, info)) {
+            ESP_LOGW(TAG, "GPS response parse failed: %s", gps_status_line(gps_response).c_str());
+            vTaskDelay(pdMS_TO_TICKS(1000));
+            continue;
+        }
+
+        if (info.run_status != last_run_status || info.fix_status != last_fix_status || info.timestamp != last_timestamp) {
+            if (info.run_status != 1) {
+                ESP_LOGI(TAG, "GPS engine not running; run=%d", info.run_status);
+            } else if (info.fix_status <= 0) {
+                ESP_LOGI(TAG, "GPS running but no fix yet (fix_status=%d, timestamp=%s)", info.fix_status, info.timestamp.c_str());
+            }
+            last_run_status = info.run_status;
+            last_fix_status = info.fix_status;
+            last_timestamp = info.timestamp;
+        }
+
+        if (info.run_status != 1) {
+            vTaskDelay(pdMS_TO_TICKS(1000));
+            continue;
+        }
+
+        if (info.fix_status <= 0) {
+            vTaskDelay(pdMS_TO_TICKS(1000));
+            continue;
+        }
+
+        if (!first_timestamp.empty() && !info.timestamp.empty() && info.timestamp == first_timestamp) {
+            if (info.timestamp != last_timestamp) {
+                ESP_LOGI(TAG, "GPS hot-start fix stale (%s); waiting for current fix", info.timestamp.c_str());
+            }
+            vTaskDelay(pdMS_TO_TICKS(1000));
+            continue;
+        }
+
+        if (first_timestamp.empty() && !info.timestamp.empty()) {
+            first_timestamp = info.timestamp;
+            ESP_LOGI(TAG, "Hot-start fix (stale): %s — waiting for current", info.timestamp.c_str());
+            vTaskDelay(pdMS_TO_TICKS(1000));
+            continue;
+        }
+
+        ESP_LOGI(TAG, "GPS fix obtained: %.6f, %.6f (sats=%d, hdop=%.2f)",
+                 info.latitude, info.longitude, info.satellites_used, info.hdop);
+        return true;
+    }
+
+    ESP_LOGW(TAG, "GPS fix timeout");
+    return false;
 }
 
 static void log_sim_status(void)
@@ -321,13 +473,48 @@ static bool is_network_registered(void)
 static bool wait_for_network_registration(uint32_t timeout_ms)
 {
     const TickType_t deadline = xTaskGetTickCount() + pdMS_TO_TICKS(timeout_ms);
+    bool saw_signal_issue = false;
     while (xTaskGetTickCount() < deadline) {
-        if (is_network_registered()) {
-            ESP_LOGI(TAG, "GSM network is registered");
+        std::string creg_response;
+        const bool creg_ok = send_at_command("AT+CREG?\r", &creg_response, 5000);
+        std::string cgreg_response;
+        const bool cgreg_ok = send_at_command("AT+CGREG?\r", &cgreg_response, 5000);
+
+        const bool creg_registered = creg_ok && parse_registration_response(creg_response);
+        const bool cgreg_registered = cgreg_ok && parse_registration_response(cgreg_response);
+        const bool registered = creg_registered || cgreg_registered;
+
+        ESP_LOGI(TAG, "SIM registration check: CREG='%s' CGREG='%s' => %s",
+                 flatten_response(creg_response).c_str(),
+                 flatten_response(cgreg_response).c_str(),
+                 registered ? "READY" : "NOT READY");
+
+        if (registered) {
+            ESP_LOGI(TAG, "Cellular network registered");
             return true;
         }
-        ESP_LOGW(TAG, "GSM network registration not ready; retrying");
-        vTaskDelay(pdMS_TO_TICKS(2000));
+
+        if (!creg_ok || !cgreg_ok) {
+            ESP_LOGW(TAG, "Network registration query failed; retrying");
+        } else if (!saw_signal_issue) {
+            ESP_LOGW(TAG, "Cellular modem is not registered yet; signal or carrier conditions may be poor");
+            saw_signal_issue = true;
+        }
+
+        if ((xTaskGetTickCount() + pdMS_TO_TICKS(10000)) >= deadline) {
+            break;
+        }
+        vTaskDelay(pdMS_TO_TICKS(5000));
+    }
+
+    ESP_LOGW(TAG, "GSM registration timeout after %u ms; checking SIM/APN state", timeout_ms);
+    ensure_apn_configured();
+
+    std::string csq_response;
+    if (send_at_command("AT+CSQ\r", &csq_response, 5000)) {
+        ESP_LOGW(TAG, "Final signal quality after registration timeout: %s", trim_response(csq_response).c_str());
+    } else {
+        ESP_LOGW(TAG, "Unable to query signal quality after registration timeout");
     }
     return false;
 }
@@ -340,12 +527,6 @@ static void log_call_activity_status(void)
         ESP_LOGI(TAG, "Phone activity status: %s", trim_response(response).c_str());
     } else {
         ESP_LOGI(TAG, "Phone activity status query returned no usable response: %s", trim_response(response).c_str());
-    }
-
-    if (send_at_command("AT+CLCC?\r", &response, 5000, "+CLCC:")) {
-        ESP_LOGI(TAG, "Current call list: %s", trim_response(response).c_str());
-    } else {
-        ESP_LOGI(TAG, "Current call list query returned no usable response: %s", trim_response(response).c_str());
     }
 }
 
@@ -556,10 +737,10 @@ bool enable_gps(void)
     return true;
 }
 
-bool get_gps_location(std::string *response)
+bool get_gps_location(std::string *response, uint32_t timeout_ms)
 {
     std::string gps_response;
-    const bool ok = send_at_command("AT+CGNSINF\r", &gps_response, 5000);
+    const bool ok = send_at_command("AT+CGNSINF\r", &gps_response, timeout_ms);
     if (response != nullptr) {
         *response = gps_response;
     }
@@ -567,7 +748,7 @@ bool get_gps_location(std::string *response)
     return ok;
 }
 
-bool run_at_step(const char *label, const std::string &command, uint32_t timeout_ms, const char *success_marker)
+__attribute__((unused)) bool run_at_step(const char *label, const std::string &command, uint32_t timeout_ms, const char *success_marker)
 {
     std::string response;
     const bool ok = send_at_command(command, &response, timeout_ms, success_marker);
@@ -576,72 +757,6 @@ bool run_at_step(const char *label, const std::string &command, uint32_t timeout
     return ok;
 }
 
-void close_geolinker_session(bool http_initialized, bool bearer_open)
-{
-    if (http_initialized) run_at_step("GeoLinker HTTP service stop", "AT+HTTPTERM\r", 5000);
-    if (bearer_open) run_at_step("GPRS bearer detach", "AT+SAPBR=0,1\r", 30000);
-}
-
-bool send_geolinker_location(double lat, double lon, int battery_percent)
-{
-    const char *api_key = get_geolinker_api_key();
-    if (api_key == nullptr || api_key[0] == '\0') {
-        ESP_LOGW(TAG, "GeoLinker API key is not configured; skipping cloud upload");
-        return false;
-    }
-
-    const std::string apn = get_gprs_apn();
-    ESP_LOGI(TAG, "GeoLinker upload started for %.6f,%.6f (battery=%d%%)", lat, lon, battery_percent);
-    if (!run_at_step("GPRS packet attach", "AT+CGATT=1\r", 30000) ||
-        !run_at_step("GPRS bearer type configuration", "AT+SAPBR=3,1,\"Contype\",\"GPRS\"\r", 5000) ||
-        !run_at_step("GPRS APN configuration", "AT+SAPBR=3,1,\"APN\",\"" + apn + "\"\r", 5000) ||
-        !run_at_step("GPRS bearer open", "AT+SAPBR=1,1\r", 30000)) {
-        ESP_LOGW(TAG, "GeoLinker upload aborted: GPRS setup failed");
-        return false;
-    }
-    bool bearer_open = true;
-    bool http_initialized = false;
-    run_at_step("GPRS bearer status", "AT+SAPBR=2,1\r", 5000);
-
-    char payload[320];
-    const int written = snprintf(payload, sizeof(payload),
-        "{\"device_id\":\"%s\",\"timestamp\":[\"%lu\"],\"lat\":[%.6f],\"long\":[%.6f],\"battery\":[%d]}",
-        get_geolinker_device_id(), static_cast<unsigned long>(xTaskGetTickCount() * portTICK_PERIOD_MS),
-        lat, lon, battery_percent >= 0 ? battery_percent : 0);
-    if (written < 0 || static_cast<size_t>(written) >= sizeof(payload)) {
-        ESP_LOGE(TAG, "GeoLinker payload overflow");
-        close_geolinker_session(http_initialized, bearer_open);
-        return false;
-    }
-
-    const std::string auth = std::string("Authorization: Bearer ") + api_key;
-    if (!run_at_step("GeoLinker HTTP service start", "AT+HTTPINIT\r", 5000)) {
-        close_geolinker_session(http_initialized, bearer_open);
-        return false;
-    }
-    http_initialized = true;
-    if (!run_at_step("GeoLinker HTTP bearer selection", "AT+HTTPPARA=\"CID\",1\r", 5000) ||
-        !run_at_step("GeoLinker HTTP URL configuration", std::string("AT+HTTPPARA=\"URL\",\"") + GEOLINKER_URL + "\"\r", 5000) ||
-        !run_at_step("GeoLinker content type configuration", "AT+HTTPPARA=\"CONTENT\",\"application/json\"\r", 5000) ||
-        !run_at_step("GeoLinker authorization configuration", std::string("AT+HTTPPARA=\"USERDATA\",\"") + auth + "\"\r", 5000) ||
-        !run_at_step("GeoLinker payload buffer request", "AT+HTTPDATA=" + std::to_string(written) + ",10000\r", 15000, "DOWNLOAD")) {
-        ESP_LOGW(TAG, "GeoLinker upload aborted: HTTP setup failed");
-        close_geolinker_session(http_initialized, bearer_open);
-        return false;
-    }
-
-    if (!run_at_step("GeoLinker payload upload", std::string(payload), 15000)) {
-        close_geolinker_session(http_initialized, bearer_open);
-        return false;
-    }
-    std::string response;
-    const bool post_ok = send_at_command("AT+HTTPACTION=1\r", &response, 30000, "+HTTPACTION:");
-    const bool accepted = post_ok && (response.find(",200,") != std::string::npos || response.find(",201,") != std::string::npos);
-    ESP_LOGI(TAG, "GeoLinker HTTP POST: %s%s", accepted ? "SUCCESS" : "FAILED",
-             response.empty() ? "" : (std::string(" -> ") + trim_response(response)).c_str());
-    close_geolinker_session(http_initialized, bearer_open);
-    return accepted;
-}
 }  // namespace
 
 extern "C" bool gl868_modem_send_at_command(const char *command, char *response, size_t response_len, uint32_t timeout_ms)
@@ -692,49 +807,33 @@ extern "C" void gl868_modem_run_full_diagnostics(void)
     }
 
     char response[512];
-    const auto log_command = [&](const char *label, const char *command, uint32_t timeout_ms = 4000) {
+    const auto run_command = [&](const char *command, const char *label, uint32_t timeout_ms = 5000) {
         const bool ok = gl868_modem_send_at_command(command, response, sizeof(response), timeout_ms);
         const std::string value = ok ? trim_response(response) : std::string("timeout/no-response");
-        ESP_LOGI(TAG, "[%s] %s", label, value.c_str());
+        ESP_LOGI(TAG, "%s: %s", label, value.c_str());
     };
 
-    ESP_LOGI(TAG, "Running full SIM868 diagnostics...");
-    log_command("AT", "AT");
-    log_command("ATI", "ATI");
+    ESP_LOGI(TAG, "---------");
+    ESP_LOGI(TAG, "Modem");
+    ESP_LOGI(TAG, "---------");
+    run_command("AT", "AT");
+    run_command("ATI", "ATI");
+    run_command("AT+CGSN", "IMEI");
+    run_command("AT+CIMI", "IMSI");
+    run_command("AT+CCID", "ICCID");
+    run_command("AT+CNUM", "Phone Number");
 
-    std::string sim_status;
-    const bool sim_ready = is_sim_ready(&sim_status);
-    ESP_LOGI(TAG, "[SIM status] %s", sim_status.c_str());
+    ESP_LOGI(TAG, "-----------");
+    ESP_LOGI(TAG, "Network");
+    ESP_LOGI(TAG, "-----------");
+    run_command("AT+COPS?", "Operator");
+    run_command("AT+CSQ", "RSSI");
+    run_command("AT+CREG?", "Registration");
 
-    log_command("Operator", "AT+COPS?");
-    log_command("Signal", "AT+CSQ");
-    log_command("Network reg", "AT+CREG?");
-    log_command("Cell reg", "AT+CGREG?");
-    log_command("Phone activity", "AT+CPAS");
-    log_command("Current calls", "AT+CLCC?");
-
-    if (sim_ready) {
-        log_command("IMEI", "AT+CGSN");
-        log_command("IMSI", "AT+CIMI");
-        log_command("ICCID", "AT+CCID");
-        log_command("Phone", "AT+CNUM");
-        log_command("Service Center", "AT+CSCA?");
-        log_command("SMS mode", "AT+CMGF=1");
-        log_command("GPRS attach", "AT+CGATT?");
-        log_command("CLIR", "AT+CLIR=2");
-        log_command("COLP", "AT+COLP=1");
-        log_command("CNUM?", "AT+CNUM?");
-        log_command("CPBS", "AT+CPBS?");
-    } else {
-        ESP_LOGI(TAG, "SIM not ready; skipping SIM-dependent diagnostics");
-    }
-
-    log_command("GPS power", "AT+CGNSPWR=1");
-    log_command("GPS info", "AT+CGNSINF", 5000);
-    log_command("CBC", "AT+CBC");
-    log_command("CENG", "AT+CENG=1,1");
-    log_command("GSM location", "AT+CIPGSMLOC=1,1", 10000);
-    ESP_LOGI(TAG, "Full diagnostics complete");
+    ESP_LOGI(TAG, "-----------");
+    ESP_LOGI(TAG, "Battery");
+    ESP_LOGI(TAG, "-----------");
+    run_command("AT+CBC", "Battery / Power Status");
 }
 
 extern "C" bool gl868_modem_send_test_sms(const char *message)
@@ -785,29 +884,45 @@ extern "C" bool gl868_modem_init(void)
 
     vTaskDelay(pdMS_TO_TICKS(2000));
     bool at_ok = false;
-    for (int attempt = 1; attempt <= 3; ++attempt) {
-        std::string response;
-        if (send_at_command("AT\r", &response, 3000)) {
-            ESP_LOGI(TAG, "Modem AT handshake: SUCCESS (attempt %d)", attempt);
-            at_ok = true;
-            break;
-        }
 
-        ESP_LOGW(TAG, "Modem AT handshake: FAILED (attempt %d) -> %s", attempt, trim_response(response).c_str());
-        if (attempt < 3) {
-            ESP_LOGI(TAG, "Waiting for modem boot and retrying initialization");
-            vTaskDelay(pdMS_TO_TICKS(3000));
-            ESP_LOGI(TAG, "Power-cycling SIM868 and retrying initialization");
-            s_state.dte.reset();
-            power_cycle_modem();
-            s_state.dte = esp_modem::create_uart_dte(&config);
-            if (!s_state.dte) {
-                ESP_LOGE(TAG, "Failed to recreate UART DTE after power cycle");
+    /* First, attempt an extended initial AT handshake to give the modem
+     * extra time to boot/respond on the very first attempt. If this fails,
+     * fall back to the existing retry + power-cycle sequence. */
+    {
+        std::string response;
+        if (send_at_command("AT\r", &response, 10000)) {
+            ESP_LOGI(TAG, "Modem AT handshake: SUCCESS");
+            at_ok = true;
+        }
+    }
+
+    if (!at_ok) {
+        for (int attempt = 1; attempt <= 3; ++attempt) {
+            std::string response;
+            if (send_at_command("AT\r", &response, 3000)) {
+                ESP_LOGI(TAG, "Modem AT handshake: SUCCESS");
+                at_ok = true;
                 break;
             }
-            vTaskDelay(pdMS_TO_TICKS(2000));
-        } else {
-            s_state.dte.reset();
+
+            if (attempt == 3) {
+                ESP_LOGW(TAG, "Modem AT handshake: FAILED after 3 attempts -> %s", trim_response(response).c_str());
+            }
+            if (attempt < 3) {
+                ESP_LOGI(TAG, "Waiting for modem boot and retrying initialization");
+                vTaskDelay(pdMS_TO_TICKS(3000));
+                ESP_LOGI(TAG, "Power-cycling SIM868 and retrying initialization");
+                s_state.dte.reset();
+                power_cycle_modem();
+                s_state.dte = esp_modem::create_uart_dte(&config);
+                if (!s_state.dte) {
+                    ESP_LOGE(TAG, "Failed to recreate UART DTE after power cycle");
+                    break;
+                }
+                vTaskDelay(pdMS_TO_TICKS(2000));
+            } else {
+                s_state.dte.reset();
+            }
         }
     }
 
@@ -815,6 +930,21 @@ extern "C" bool gl868_modem_init(void)
         s_state.dte.reset();
         gpio_set_level(GPIO_NUM_42, 0);
         return false;
+    }
+
+    if (!wait_for_sim_ready(30000)) {
+        ESP_LOGW(TAG, "SIM card did not become ready during init; check SIM presence and PIN state");
+        s_state.dte.reset();
+        gpio_set_level(GPIO_NUM_42, 0);
+        return false;
+    }
+
+    ensure_apn_configured();
+
+    /* Wait for basic GSM network registration to complete during init so
+     * that subsequent operations can assume network availability. */
+    if (!wait_for_network_registration(45000)) {
+        ESP_LOGW(TAG, "GSM network registration did not complete during init; poor signal, carrier, or SIM may be preventing registration");
     }
 
     std::string response;
@@ -830,6 +960,9 @@ extern "C" bool gl868_modem_init(void)
     s_state.gps_enabled = enable_gps();
     s_state.initialized = true;
     ESP_LOGI(TAG, "SIM868 modem bridge initialized (GPS=%d)", s_state.gps_enabled);
+
+    ESP_LOGI(TAG, "Running full SIM868 diagnostics after modem initialization");
+    gl868_modem_run_full_diagnostics();
     return true;
 }
 
@@ -849,7 +982,7 @@ extern "C" void gl868_modem_trigger_emergency(const char *source, int32_t value)
     const char *call_number = get_emergency_call_number();
     const char *sms_number = get_emergency_sms_number();
     ESP_LOGI(TAG, "Emergency call target: %s", call_number);
-    ESP_LOGI(TAG, "Emergency SMS target: %s", sms_number);
+    ESP_LOGI(TAG, "Emergency SMS target (forced): %s", sms_number);
 
     std::string sim_status;
     if (!is_sim_ready(&sim_status)) {
@@ -864,25 +997,20 @@ extern "C" void gl868_modem_trigger_emergency(const char *source, int32_t value)
     std::string gps_response;
     GpsFixInfo fix_info;
     bool gps_ok = false;
-    for (int attempt = 0; attempt < 2; ++attempt) {
-        if (get_gps_location(&gps_response) && parse_gps_fix_info_from_cgnsinf(gps_response, fix_info)) {
-            gps_ok = true;
-            break;
-        }
-        if (attempt == 0) {
-            ESP_LOGW(TAG, "GPS fix not ready; retrying after 2 seconds");
-            vTaskDelay(pdMS_TO_TICKS(2000));
-        }
-    }
-    if (gps_ok) {
+    /* Single immediate GPS attempt: if it fails, schedule deferred retries
+     * and continue with emergency SMS/call without blocking here. */
+    if (get_gps_location(&gps_response, 10000) && parse_gps_fix_info_from_cgnsinf(gps_response, fix_info)) {
+        gps_ok = true;
         ESP_LOGI(TAG, "GPS fix accepted: status=%d mode=%d hdop=%.2f sats=%d/%d",
                  fix_info.fix_status, fix_info.fix_mode, fix_info.hdop,
                  fix_info.satellites_used, fix_info.satellites_in_view);
+        ESP_LOGI(TAG, "AT+CGNSINF response: %s", gps_status_line(gps_response).c_str());
         if (fix_info.hdop > 5.0) {
             ESP_LOGW(TAG, "GPS accuracy is low (hdop=%.2f); map location may be imprecise", fix_info.hdop);
         }
     } else {
-        ESP_LOGW(TAG, "GPS coordinates unavailable or invalid: %s", gps_status_line(gps_response).c_str());
+        ESP_LOGW(TAG, "Immediate GPS attempt failed: %s; requesting deferred retry via main task", gps_status_line(gps_response).c_str());
+        gl868_modem_request_deferred_gps_upload();
     }
 
     // build message: include battery percent if available and Google Maps link when possible
@@ -964,34 +1092,27 @@ extern "C" bool gl868_modem_get_gps_now(char *buf, size_t buf_len)
 extern "C" bool gl868_modem_get_gps_coordinates(double *latitude, double *longitude)
 {
     if (!s_state.initialized || latitude == nullptr || longitude == nullptr) return false;
-    std::string gps;
-    if (!get_gps_location(&gps)) return false;
+
+    std::string gps_response;
     GpsFixInfo fix;
-    if (!parse_gps_fix_info_from_cgnsinf(gps, fix)) {
-        ESP_LOGW(TAG, "GPS fix: NOT AVAILABLE -> %s", gps_status_line(gps).c_str());
+    if (!get_gps_location(&gps_response, 10000)) {
+        ESP_LOGW(TAG, "GPS location query failed: %s", gps_status_line(gps_response).c_str());
         return false;
     }
+    if (!parse_gps_fix_info_from_cgnsinf(gps_response, fix)) {
+        ESP_LOGW(TAG, "GPS response parse failed: %s", gps_status_line(gps_response).c_str());
+        return false;
+    }
+    if (fix.fix_status <= 0) {
+        ESP_LOGW(TAG, "GPS fix unavailable: run=%d fix_status=%d timestamp=%s", fix.run_status, fix.fix_status, fix.timestamp.c_str());
+        return false;
+    }
+
     *latitude = fix.latitude;
     *longitude = fix.longitude;
-    ESP_LOGI(TAG, "GPS fix: SUCCESS -> %.6f,%.6f (fix_status=%d fix_mode=%d hdop=%.2f sats=%d/%d)",
-             *latitude, *longitude, fix.fix_status, fix.fix_mode, fix.hdop,
-             fix.satellites_used, fix.satellites_in_view);
-    if (fix.hdop > 5.0) {
-        ESP_LOGW(TAG, "GPS fix available but accuracy is low (hdop=%.2f); expect larger position error", fix.hdop);
-    }
-    if (fix.fix_mode == 1) {
-        ESP_LOGW(TAG, "GPS fix is only 2D (fix_mode=1); vertical accuracy may be limited");
-    }
-    if (fix.satellites_used >= 0 && fix.satellites_used < 4) {
-        ESP_LOGW(TAG, "GPS fix uses few satellites (%d); coordinate accuracy may be reduced", fix.satellites_used);
-    }
+    ESP_LOGI(TAG, "GPS fix: SUCCESS -> %.6f,%.6f (hdop=%.2f, sats=%d)",
+             fix.latitude, fix.longitude, fix.hdop, fix.satellites_used);
     return true;
-}
-
-extern "C" bool gl868_modem_send_geolinker_location(double latitude, double longitude, int battery_percent)
-{
-    if (!s_state.initialized) return false;
-    return send_geolinker_location(latitude, longitude, battery_percent);
 }
 
 extern "C" const char *gl868_modem_get_emergency_call_number(void)

@@ -46,19 +46,9 @@
 
 static const char *TAG = "SMART_SAFETY_BAND_001";
 
-typedef enum { MOTION_NONE, MOTION_LSM6DSOX, MOTION_LIS3DH } motion_sensor_t;
-typedef struct { int32_t x_mg, y_mg, z_mg, magnitude_mg; } acceleration_sample_t;
 typedef enum { COMM_EVENT_EMERGENCY, COMM_EVENT_GPS_UPLOAD } communication_event_type_t;
 typedef struct { communication_event_type_t type; const char *source; } communication_event_t;
-typedef struct {
-    i2c_master_bus_handle_t bus;
-    i2c_master_dev_handle_t motion;
-    motion_sensor_t motion_type;
-    bool bme68x_present, scd4x_present, veml6075_present, as3935_present;
-    bool pulse_ox_present, skin_temp_present, gsr_present;
-} sensor_bus_t;
 
-// static sensor_bus_t s_sensors;
 static SemaphoreHandle_t s_i2c_mutex;
 static SemaphoreHandle_t s_sos_sem;
 static QueueHandle_t s_communication_events;
@@ -75,53 +65,10 @@ static void queue_communication_event(communication_event_type_t type, const cha
     }
 }
 
-/*
-static esp_err_t motion_read(uint8_t reg, uint8_t *data, size_t length)
+void gl868_modem_request_deferred_gps_upload(void)
 {
-    if (!s_sensors.motion) return ESP_ERR_INVALID_STATE;
-    if (xSemaphoreTake(s_i2c_mutex, pdMS_TO_TICKS(I2C_TIMEOUT_MS)) != pdTRUE) return ESP_ERR_TIMEOUT;
-    esp_err_t result = i2c_master_transmit_receive(s_sensors.motion, &reg, 1, data, length, I2C_TIMEOUT_MS);
-    xSemaphoreGive(s_i2c_mutex);
-    return result;
+    queue_communication_event(COMM_EVENT_GPS_UPLOAD, "deferred gps retry");
 }
-
-static __attribute__((unused)) esp_err_t motion_write(uint8_t reg, uint8_t value)
-{
-    uint8_t data[] = {reg, value};
-    if (xSemaphoreTake(s_i2c_mutex, pdMS_TO_TICKS(I2C_TIMEOUT_MS)) != pdTRUE) return ESP_ERR_TIMEOUT;
-    esp_err_t result = i2c_master_transmit(s_sensors.motion, data, sizeof(data), I2C_TIMEOUT_MS);
-    xSemaphoreGive(s_i2c_mutex);
-    return result;
-}
-
-static bool i2c_probe(uint8_t address)
-{
-    if (xSemaphoreTake(s_i2c_mutex, pdMS_TO_TICKS(I2C_TIMEOUT_MS)) != pdTRUE) return false;
-    esp_err_t result = i2c_master_probe(s_sensors.bus, address, I2C_TIMEOUT_MS);
-    xSemaphoreGive(s_i2c_mutex);
-    return result == ESP_OK;
-}
-
-static __attribute__((unused)) bool any_present(const uint8_t *addresses, size_t count)
-{
-    for (size_t i = 0; i < count; ++i) if (i2c_probe(addresses[i])) return true;
-    return false;
-}
-
-static __attribute__((unused)) bool add_motion_device(const uint8_t *addresses, size_t count, motion_sensor_t type)
-{
-    for (size_t i = 0; i < count; ++i) {
-        if (!i2c_probe(addresses[i])) continue;
-        i2c_device_config_t config = {.dev_addr_length = I2C_ADDR_BIT_LEN_7, .device_address = addresses[i], .scl_speed_hz = 400000};
-        if (i2c_master_bus_add_device(s_sensors.bus, &config, &s_sensors.motion) == ESP_OK) {
-            s_sensors.motion_type = type;
-            ESP_LOGI(TAG, "Motion sensor found at 0x%02X", addresses[i]);
-            return true;
-        }
-    }
-    return false;
-}
-*/
 
 static void IRAM_ATTR sos_isr(void *argument)
 {
@@ -140,7 +87,6 @@ static void init_io(void)
     ESP_ERROR_CHECK(gpio_config(&input));
     int initial_level = gpio_get_level(SOS_BUTTON_GPIO);
     s_sos_button_last_level = initial_level;
-    ESP_LOGI(TAG, "SOS GPIO %d initial level: %d; expected idle=%d, active=%d", SOS_BUTTON_GPIO, initial_level, s_sos_button_idle_level, s_sos_button_active_level);
     if (initial_level != s_sos_button_idle_level) {
         ESP_LOGW(TAG, "SOS GPIO %d booted in active state or is held low; check wiring and button contact", SOS_BUTTON_GPIO);
     }
@@ -161,7 +107,7 @@ static void communication_task(void *argument)
             modem_ready = gl868_modem_init();
             if (modem_ready) {
                 xEventGroupSetBits(s_system_events, BIT_MODEM_READY);
-                ESP_LOGI(TAG, "SIM868 ready for emergency, GPS and GPRS services");
+                ESP_LOGI(TAG, "SIM868 ready for emergency and GPS services");
                 ESP_LOGI(TAG, "Boot complete. Emergency SMS recipient(s): %s", gl868_modem_get_emergency_sms_number());
                 ESP_LOGI(TAG, "Boot complete. Emergency call recipient: %s", gl868_modem_get_emergency_call_number());
             } else {
@@ -179,13 +125,11 @@ static void communication_task(void *argument)
             double latitude = 0.0;
             double longitude = 0.0;
             if (!gl868_modem_get_gps_coordinates(&latitude, &longitude)) {
-                ESP_LOGW(TAG, "No valid GPS fix; GeoLinker upload deferred");
+                ESP_LOGW(TAG, "No valid GPS fix");
                 continue;
             }
             const int battery = gl868_modem_get_battery_percent();
-            if (!gl868_modem_send_geolinker_location(latitude, longitude, battery)) {
-                ESP_LOGW(TAG, "GeoLinker upload failed; it will be retried at the next interval");
-            }
+            ESP_LOGI(TAG, "GPS sample: %.6f,%.6f (battery=%d%%)", latitude, longitude, battery);
         }
     }
 }
@@ -203,7 +147,6 @@ static __attribute__((unused)) void gps_task(void *argument)
 static __attribute__((unused)) void sos_button_task(void *argument)
 {
     int last_level = gpio_get_level(SOS_BUTTON_GPIO);
-    ESP_LOGI(TAG, "SOS button live debug started; initial level=%d", last_level);
     for (;;) {
         int level = gpio_get_level(SOS_BUTTON_GPIO);
         if (level != last_level) {
@@ -221,55 +164,6 @@ static __attribute__((unused)) void sos_button_task(void *argument)
     }
 }
 
-/*
-static uint32_t integer_sqrt(uint32_t value)
-{
-    uint32_t result = 0;
-    uint32_t bit = 1UL << 30;
-    while (bit > value) bit >>= 2;
-    while (bit != 0) {
-        if (value >= result + bit) {
-            value -= result + bit;
-            result = (result >> 1) + bit;
-        } else result >>= 1;
-        bit >>= 2;
-    }
-    return result;
-}
-
-bool motion_read_acceleration(acceleration_sample_t *sample)
-{
-    uint8_t raw[6];
-    // LIS3DH requires bit 7 for multi-register address auto-increment. 
-    uint8_t data_register = s_sensors.motion_type == MOTION_LIS3DH ? 0xA8 : 0x28;
-    if (s_sensors.motion_type == MOTION_NONE || motion_read(data_register, raw, sizeof(raw)) != ESP_OK) return false;
-    int16_t x = (int16_t)((uint16_t)raw[0] | ((uint16_t)raw[1] << 8));
-    int16_t y = (int16_t)((uint16_t)raw[2] | ((uint16_t)raw[3] << 8));
-    int16_t z = (int16_t)((uint16_t)raw[4] | ((uint16_t)raw[5] << 8));
-    if (s_sensors.motion_type == MOTION_LIS3DH) {
-        x >>= 4;
-        y >>= 4;
-        z >>= 4;
-    }
-    int32_t x_mg = s_sensors.motion_type == MOTION_LSM6DSOX ? (x * 61) / 1000 : x;
-    int32_t y_mg = s_sensors.motion_type == MOTION_LSM6DSOX ? (y * 61) / 1000 : y;
-    int32_t z_mg = s_sensors.motion_type == MOTION_LSM6DSOX ? (z * 61) / 1000 : z;
-    sample->x_mg = x_mg;
-    sample->y_mg = y_mg;
-    sample->z_mg = z_mg;
-    sample->magnitude_mg = (int32_t)integer_sqrt((uint32_t)(x_mg * x_mg + y_mg * y_mg + z_mg * z_mg));
-    return true;
-}
-
-// Expose a simple C API to get the current motion magnitude in mg.
-int32_t get_motion_magnitude_mg(void)
-{
-    acceleration_sample_t sample;
-    if (!motion_read_acceleration(&sample)) return 0;
-    return sample.magnitude_mg;
-}
-*/
-
 void app_main(void)
 {
     s_i2c_mutex = xSemaphoreCreateMutex(); 
@@ -283,5 +177,5 @@ void app_main(void)
     xTaskCreate(sos_button_task, "sos_button", 2048, NULL, 8, NULL);
     ESP_LOGI(TAG, "SOS button task started on GPIO %d", SOS_BUTTON_GPIO);
     xTaskCreate(gps_task, "gps_upload", 2048, NULL, 4, NULL);
-    ESP_LOGI(TAG, "GPS fix and GeoLinker GPRS uploads are enabled");
+    ESP_LOGI(TAG, "GPS fix");
 }
