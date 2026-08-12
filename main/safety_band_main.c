@@ -58,11 +58,14 @@ typedef struct {
     bool pulse_ox_present, skin_temp_present, gsr_present;
 } sensor_bus_t;
 
-static sensor_bus_t s_sensors;
+// static sensor_bus_t s_sensors;
 static SemaphoreHandle_t s_i2c_mutex;
 static SemaphoreHandle_t s_sos_sem;
 static QueueHandle_t s_communication_events;
 static EventGroupHandle_t s_system_events;
+static const int s_sos_button_idle_level = 1;
+static const int s_sos_button_active_level = 0;
+static int s_sos_button_last_level = 1;
 
 static void queue_communication_event(communication_event_type_t type, const char *source)
 {
@@ -72,6 +75,7 @@ static void queue_communication_event(communication_event_type_t type, const cha
     }
 }
 
+/*
 static esp_err_t motion_read(uint8_t reg, uint8_t *data, size_t length)
 {
     if (!s_sensors.motion) return ESP_ERR_INVALID_STATE;
@@ -117,6 +121,7 @@ static __attribute__((unused)) bool add_motion_device(const uint8_t *addresses, 
     }
     return false;
 }
+*/
 
 static void IRAM_ATTR sos_isr(void *argument)
 {
@@ -133,6 +138,12 @@ static void init_io(void)
     gpio_config_t input = {.pin_bit_mask = (1ULL << SOS_BUTTON_GPIO), .mode = GPIO_MODE_INPUT,
                            .pull_up_en = GPIO_PULLUP_ENABLE, .intr_type = GPIO_INTR_ANYEDGE};
     ESP_ERROR_CHECK(gpio_config(&input));
+    int initial_level = gpio_get_level(SOS_BUTTON_GPIO);
+    s_sos_button_last_level = initial_level;
+    ESP_LOGI(TAG, "SOS GPIO %d initial level: %d; expected idle=%d, active=%d", SOS_BUTTON_GPIO, initial_level, s_sos_button_idle_level, s_sos_button_active_level);
+    if (initial_level != s_sos_button_idle_level) {
+        ESP_LOGW(TAG, "SOS GPIO %d booted in active state or is held low; check wiring and button contact", SOS_BUTTON_GPIO);
+    }
     ESP_ERROR_CHECK(gpio_install_isr_service(0));
     ESP_ERROR_CHECK(gpio_isr_handler_add(SOS_BUTTON_GPIO, sos_isr, s_sos_sem));
 }
@@ -180,7 +191,7 @@ static void communication_task(void *argument)
 }
 
 /* Schedules two-minute live-location uploads without competing for modem UART. */
-static void gps_task(void *argument)
+static __attribute__((unused)) void gps_task(void *argument)
 {
     xEventGroupWaitBits(s_system_events, BIT_MODEM_READY, pdFALSE, pdTRUE, portMAX_DELAY);
     for (;;) {
@@ -189,22 +200,28 @@ static void gps_task(void *argument)
     }
 }
 
-static void sos_button_task(void *argument)
+static __attribute__((unused)) void sos_button_task(void *argument)
 {
+    int last_level = gpio_get_level(SOS_BUTTON_GPIO);
+    ESP_LOGI(TAG, "SOS button live debug started; initial level=%d", last_level);
     for (;;) {
-        xSemaphoreTake(s_sos_sem, portMAX_DELAY);
-        if (gpio_get_level(SOS_BUTTON_GPIO) != 0) continue;
-        vTaskDelay(pdMS_TO_TICKS(SOS_DEBOUNCE_MS));
-        if (gpio_get_level(SOS_BUTTON_GPIO) == 0) {
-            ESP_LOGW(TAG, "SOS button pressed; sending emergency SMS and call");
-            queue_communication_event(COMM_EVENT_EMERGENCY, "SOS button");
-            while (gpio_get_level(SOS_BUTTON_GPIO) == 0) {
-                xSemaphoreTake(s_sos_sem, pdMS_TO_TICKS(100));
+        int level = gpio_get_level(SOS_BUTTON_GPIO);
+        if (level != last_level) {
+            if (level == s_sos_button_active_level) {
+                ESP_LOGW(TAG, "SOS button became active (press detected)");
+                queue_communication_event(COMM_EVENT_EMERGENCY, "SOS button");
+            } else if (level == s_sos_button_idle_level) {
+                ESP_LOGI(TAG, "SOS button became idle (release detected)");
+            } else {
+                ESP_LOGI(TAG, "SOS button unusual level: %d", level);
             }
+            last_level = level;
         }
+        vTaskDelay(pdMS_TO_TICKS(100));
     }
 }
 
+/*
 static uint32_t integer_sqrt(uint32_t value)
 {
     uint32_t result = 0;
@@ -223,7 +240,7 @@ static uint32_t integer_sqrt(uint32_t value)
 bool motion_read_acceleration(acceleration_sample_t *sample)
 {
     uint8_t raw[6];
-    /* LIS3DH requires bit 7 for multi-register address auto-increment. */
+    // LIS3DH requires bit 7 for multi-register address auto-increment. 
     uint8_t data_register = s_sensors.motion_type == MOTION_LIS3DH ? 0xA8 : 0x28;
     if (s_sensors.motion_type == MOTION_NONE || motion_read(data_register, raw, sizeof(raw)) != ESP_OK) return false;
     int16_t x = (int16_t)((uint16_t)raw[0] | ((uint16_t)raw[1] << 8));
@@ -251,6 +268,7 @@ int32_t get_motion_magnitude_mg(void)
     if (!motion_read_acceleration(&sample)) return 0;
     return sample.magnitude_mg;
 }
+*/
 
 void app_main(void)
 {
@@ -261,6 +279,9 @@ void app_main(void)
     configASSERT(s_i2c_mutex && s_sos_sem && s_communication_events && s_system_events);
     init_io();
     xTaskCreate(communication_task, "communication", 6144, NULL, 10, NULL);
+    ESP_LOGI(TAG, "Communication task started for modem UART access");
     xTaskCreate(sos_button_task, "sos_button", 2048, NULL, 8, NULL);
+    ESP_LOGI(TAG, "SOS button task started on GPIO %d", SOS_BUTTON_GPIO);
     xTaskCreate(gps_task, "gps_upload", 2048, NULL, 4, NULL);
+    ESP_LOGI(TAG, "GPS fix and GeoLinker GPRS uploads are enabled");
 }

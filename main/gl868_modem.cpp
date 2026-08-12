@@ -56,11 +56,18 @@ static void log_sim_status(void);
 static void log_call_activity_status(void);
 static const char *get_emergency_call_number(void);
 static const char *get_emergency_sms_number(void);
-static bool parse_latlon_from_cgnsinf(const std::string &cgnsinf, double &lat, double &lon);
 static std::vector<std::string> split_recipients(const std::string &list);
 static bool send_geolinker_location(double lat, double lon, int battery_percent);
 static bool run_at_step(const char *label, const std::string &command, uint32_t timeout_ms, const char *success_marker = nullptr);
 static void close_geolinker_session(bool http_initialized, bool bearer_open);
+
+static std::string gps_status_line(const std::string &response)
+{
+    const size_t start = response.find("+CGNSINF:");
+    if (start == std::string::npos) return "no +CGNSINF response";
+    const size_t end = response.find_first_of("\r\n", start);
+    return trim_response(response.substr(start, end == std::string::npos ? std::string::npos : end - start));
+}
 
 static const char *get_gprs_apn(void)
 {
@@ -182,37 +189,64 @@ static std::vector<std::string> split_recipients(const std::string &list)
     return out;
 }
 
-static bool parse_latlon_from_cgnsinf(const std::string &cgnsinf, double &lat, double &lon)
+struct GpsFixInfo {
+    bool valid = false;
+    int fix_status = -1;
+    int fix_mode = -1;
+    double latitude = 0.0;
+    double longitude = 0.0;
+    double hdop = -1.0;
+    int satellites_in_view = -1;
+    int satellites_used = -1;
+};
+
+static bool parse_gps_fix_info_from_cgnsinf(const std::string &cgnsinf, GpsFixInfo &info)
 {
-    // Look for a line starting with +CGNSINF: and parse CSV fields.
     const size_t pos = cgnsinf.find("+CGNSINF:");
     if (pos == std::string::npos) return false;
     const size_t line_end = cgnsinf.find('\n', pos);
     const std::string line = (line_end == std::string::npos) ? cgnsinf.substr(pos) : cgnsinf.substr(pos, line_end - pos);
-    // strip prefix
     size_t colon = line.find(':');
     if (colon == std::string::npos) return false;
     std::string rest = line.substr(colon + 1);
-    // trim
     const std::string trimmed = trim_response(rest);
-    // tokenize by comma
+
     std::vector<std::string> fields;
     size_t s = 0;
     while (s < trimmed.size()) {
         size_t p = trimmed.find(',', s);
         if (p == std::string::npos) { fields.push_back(trimmed.substr(s)); break; }
-        fields.push_back(trimmed.substr(s, p - s)); s = p + 1;
+        fields.push_back(trimmed.substr(s, p - s));
+        s = p + 1;
     }
-    // CGNSINF format: <GNSS run status>,<Fix status>,<UTC>,<lat>,<lon>,... so lat is field[3], lon field[4]
+
     if (fields.size() < 5) return false;
-    // convert using strtod to avoid exceptions (exceptions disabled in build)
+    info.fix_status = static_cast<int>(strtol(fields[1].c_str(), nullptr, 10));
+    if (info.fix_status <= 0) return false;
+
     char *endptr = nullptr;
-    lat = strtod(fields[3].c_str(), &endptr);
+    info.latitude = strtod(fields[3].c_str(), &endptr);
     if (endptr == fields[3].c_str()) return false;
-    lon = strtod(fields[4].c_str(), &endptr);
+    info.longitude = strtod(fields[4].c_str(), &endptr);
     if (endptr == fields[4].c_str()) return false;
-    // validate ranges
-    if (lat < -90.0 || lat > 90.0 || lon < -180.0 || lon > 180.0) return false;
+    if (info.latitude < -90.0 || info.latitude > 90.0 || info.longitude < -180.0 || info.longitude > 180.0) {
+        return false;
+    }
+
+    if (fields.size() > 8) {
+        info.fix_mode = static_cast<int>(strtol(fields[8].c_str(), nullptr, 10));
+    }
+    if (fields.size() > 10) {
+        info.hdop = strtod(fields[10].c_str(), &endptr);
+        if (endptr == fields[10].c_str()) info.hdop = -1.0;
+    }
+    if (fields.size() > 14) {
+        info.satellites_in_view = static_cast<int>(strtol(fields[14].c_str(), nullptr, 10));
+    }
+    if (fields.size() > 15) {
+        info.satellites_used = static_cast<int>(strtol(fields[15].c_str(), nullptr, 10));
+    }
+    info.valid = true;
     return true;
 }
 
@@ -234,6 +268,70 @@ static void log_sim_status(void)
     }
 }
 
+static bool parse_registration_response(const std::string &response)
+{
+    const std::string trimmed = trim_response(response);
+    return trimmed.find(",1") != std::string::npos || trimmed.find(",5") != std::string::npos;
+}
+
+static void report_registration_query(const char *label, const std::string &response)
+{
+    const std::string trimmed = trim_response(response);
+    ESP_LOGI(TAG, "%s response: %s", label, trimmed.c_str());
+}
+
+static __attribute__((unused)) bool log_network_registration(void)
+{
+    std::string creg_response;
+    const bool creg_ok = send_at_command("AT+CREG?\r", &creg_response, 5000);
+    report_registration_query("AT+CREG?", creg_response);
+
+    std::string cgreg_response;
+    const bool cgreg_ok = send_at_command("AT+CGREG?\r", &cgreg_response, 5000);
+    report_registration_query("AT+CGREG?", cgreg_response);
+
+    const bool creg_registered = creg_ok && parse_registration_response(creg_response);
+    const bool cgreg_registered = cgreg_ok && parse_registration_response(cgreg_response);
+    const bool registered = creg_registered || cgreg_registered;
+    ESP_LOGI(TAG, "GSM network registration status: %s (CREG=%s, CGREG=%s)",
+             registered ? "READY" : "NOT READY",
+             creg_registered ? "READY" : "NOT READY",
+             cgreg_registered ? "READY" : "NOT READY");
+    return registered;
+}
+
+static bool is_network_registered(void)
+{
+    std::string response;
+    if (send_at_command("AT+CREG?\r", &response, 5000)) {
+        const std::string result = trim_response(response);
+        if (result.find(",1") != std::string::npos || result.find(",5") != std::string::npos) {
+            return true;
+        }
+    }
+    if (send_at_command("AT+CGREG?\r", &response, 5000)) {
+        const std::string result = trim_response(response);
+        if (result.find(",1") != std::string::npos || result.find(",5") != std::string::npos) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static bool wait_for_network_registration(uint32_t timeout_ms)
+{
+    const TickType_t deadline = xTaskGetTickCount() + pdMS_TO_TICKS(timeout_ms);
+    while (xTaskGetTickCount() < deadline) {
+        if (is_network_registered()) {
+            ESP_LOGI(TAG, "GSM network is registered");
+            return true;
+        }
+        ESP_LOGW(TAG, "GSM network registration not ready; retrying");
+        vTaskDelay(pdMS_TO_TICKS(2000));
+    }
+    return false;
+}
+
 static void log_call_activity_status(void)
 {
     std::string response;
@@ -248,6 +346,61 @@ static void log_call_activity_status(void)
         ESP_LOGI(TAG, "Current call list: %s", trim_response(response).c_str());
     } else {
         ESP_LOGI(TAG, "Current call list query returned no usable response: %s", trim_response(response).c_str());
+    }
+}
+
+static void log_call_preflight(void)
+{
+    std::string response;
+    if (send_at_command("AT+CSQ\r", &response, 5000, "+CSQ:")) {
+        ESP_LOGI(TAG, "Signal quality before call: %s", trim_response(response).c_str());
+    } else {
+        ESP_LOGW(TAG, "Unable to query signal quality before call: %s", trim_response(response).c_str());
+    }
+    if (send_at_command("AT+CPAS\r", &response, 4000, "+CPAS:")) {
+        ESP_LOGI(TAG, "Phone activity before call: %s", trim_response(response).c_str());
+    } else {
+        ESP_LOGW(TAG, "Unable to query phone activity before call: %s", trim_response(response).c_str());
+    }
+}
+
+static bool clcc_has_active_call(const std::string &response)
+{
+    size_t pos = 0;
+    while ((pos = response.find("+CLCC:", pos)) != std::string::npos) {
+        const size_t line_end = response.find('\n', pos);
+        std::string line = response.substr(pos, line_end == std::string::npos ? std::string::npos : line_end - pos);
+        pos = line_end == std::string::npos ? std::string::npos : line_end + 1;
+        const size_t colon = line.find(':');
+        if (colon == std::string::npos) continue;
+        std::string rest = line.substr(colon + 1);
+        std::vector<std::string> fields;
+        size_t start = 0;
+        while (start < rest.size()) {
+            size_t comma = rest.find(',', start);
+            if (comma == std::string::npos) {
+                fields.push_back(trim_response(rest.substr(start)));
+                break;
+            }
+            fields.push_back(trim_response(rest.substr(start, comma - start)));
+            start = comma + 1;
+        }
+        if (fields.size() < 3) continue;
+        int stat = atoi(fields[2].c_str());
+        if (stat == 0 || stat == 1 || stat == 2 || stat == 3 || stat == 5) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static void log_call_failure_details(void)
+{
+    std::string response;
+    if (send_at_command("AT+CEER\r", &response, 5000)) {
+        ESP_LOGI(TAG, "Call extended error report: %s", trim_response(response).c_str());
+    } else {
+        ESP_LOGI(TAG, "Call extended error report not available; call may have completed successfully or no extended error was reported");
     }
 }
 
@@ -335,18 +488,55 @@ bool make_call(const std::string &number)
     std::string response;
     std::string cmd = "ATD" + number + ";\r";
     ESP_LOGI(TAG, "Issuing emergency call command: %s", cmd.c_str());
-    const bool ok = send_at_command(cmd, &response, 6000);
+    const bool ok = send_at_command(cmd, &response, 15000);
     const std::string trimmed = trim_response(response);
-    if (ok) {
-        ESP_LOGI(TAG, "Emergency call command succeeded: %s", trimmed.c_str());
+    ESP_LOGI(TAG, "Emergency call raw response: %s", trimmed.c_str());
+
+    bool explicit_error = false;
+    if (trimmed.find("ERROR") != std::string::npos || trimmed.find("FAIL") != std::string::npos || trimmed.find("+CME ERROR") != std::string::npos || trimmed.find("+CMS ERROR") != std::string::npos) {
+        explicit_error = true;
+    }
+
+    if (!ok && explicit_error) {
+        ESP_LOGW(TAG, "Emergency call command failed: %s", trimmed.c_str());
+        return false;
+    }
+
+    if (!ok && !explicit_error) {
+        ESP_LOGI(TAG, "Emergency call command completed without explicit OK; verifying call state");
+    }
+
+    vTaskDelay(pdMS_TO_TICKS(2000));
+    std::string clcc_response;
+    bool had_active_call = false;
+    if (send_at_command("AT+CLCC?\r", &clcc_response, 5000)) {
+        ESP_LOGI(TAG, "Post-dial call list: %s", trim_response(clcc_response).c_str());
+        if (clcc_has_active_call(clcc_response)) {
+            ESP_LOGI(TAG, "Ongoing call confirmed by AT+CLCC?");
+            had_active_call = true;
+        }
+    } else {
+        ESP_LOGI(TAG, "Post-dial call list query failed: %s", trim_response(clcc_response).c_str());
+    }
+
+    if (had_active_call) {
         return true;
     }
 
-    if (trimmed.empty()) {
-        return true;
+    std::string pas_response;
+    if (send_at_command("AT+CPAS\r", &pas_response, 5000, "+CPAS:")) {
+        ESP_LOGI(TAG, "Phone activity after dial: %s", trim_response(pas_response).c_str());
+        const std::string pas_trimmed = trim_response(pas_response);
+        if (pas_trimmed.find("+CPAS: 3") != std::string::npos || pas_trimmed.find("+CPAS: 4") != std::string::npos) {
+            ESP_LOGI(TAG, "Call activity detected after dial");
+            return true;
+        }
     }
 
-    ESP_LOGW(TAG, "Emergency call command failed: %s", trimmed.c_str());
+    if (trimmed.find("NO CARRIER") != std::string::npos) {
+        ESP_LOGI(TAG, "Call command returned NO CARRIER; confirming active call state with AT+CLCC?/AT+CPAS?");
+    }
+
     return false;
 }
 
@@ -373,7 +563,7 @@ bool get_gps_location(std::string *response)
     if (response != nullptr) {
         *response = gps_response;
     }
-    if (!ok) ESP_LOGW(TAG, "GPS query failed: %s", trim_response(gps_response).c_str());
+    if (!ok) ESP_LOGW(TAG, "GPS query: FAILED (%s)", gps_status_line(gps_response).c_str());
     return ok;
 }
 
@@ -631,6 +821,11 @@ extern "C" bool gl868_modem_init(void)
     if (!send_at_command("AT+CMEE=2\r", &response, 3000)) {
         ESP_LOGW(TAG, "Failed to enable verbose modem errors: %s", trim_response(response).c_str());
     }
+    if (!send_at_command("AT+CIURC=0\r", &response, 3000)) {
+        ESP_LOGW(TAG, "Initial readiness URCs disable: FAILED -> %s", trim_response(response).c_str());
+    } else {
+        ESP_LOGI(TAG, "Initial readiness URCs disabled (Call Ready/SMS Ready)");
+    }
 
     s_state.gps_enabled = enable_gps();
     s_state.initialized = true;
@@ -662,9 +857,33 @@ extern "C" void gl868_modem_trigger_emergency(const char *source, int32_t value)
         return;
     }
     log_sim_status();
+    if (!wait_for_network_registration(30000)) {
+        ESP_LOGW(TAG, "GSM network registration failed after 30 seconds; emergency alert may not be delivered");
+    }
 
     std::string gps_response;
-    get_gps_location(&gps_response);
+    GpsFixInfo fix_info;
+    bool gps_ok = false;
+    for (int attempt = 0; attempt < 2; ++attempt) {
+        if (get_gps_location(&gps_response) && parse_gps_fix_info_from_cgnsinf(gps_response, fix_info)) {
+            gps_ok = true;
+            break;
+        }
+        if (attempt == 0) {
+            ESP_LOGW(TAG, "GPS fix not ready; retrying after 2 seconds");
+            vTaskDelay(pdMS_TO_TICKS(2000));
+        }
+    }
+    if (gps_ok) {
+        ESP_LOGI(TAG, "GPS fix accepted: status=%d mode=%d hdop=%.2f sats=%d/%d",
+                 fix_info.fix_status, fix_info.fix_mode, fix_info.hdop,
+                 fix_info.satellites_used, fix_info.satellites_in_view);
+        if (fix_info.hdop > 5.0) {
+            ESP_LOGW(TAG, "GPS accuracy is low (hdop=%.2f); map location may be imprecise", fix_info.hdop);
+        }
+    } else {
+        ESP_LOGW(TAG, "GPS coordinates unavailable or invalid: %s", gps_status_line(gps_response).c_str());
+    }
 
     // build message: include battery percent if available and Google Maps link when possible
     int batt = -1;
@@ -677,16 +896,17 @@ extern "C" void gl868_modem_trigger_emergency(const char *source, int32_t value)
         }
     }
     char message[320];
-    double lat = 0.0, lon = 0.0;
-    bool has_coords = parse_latlon_from_cgnsinf(gps_response, lat, lon);
-    if (has_coords) {
+    if (gps_ok) {
         snprintf(message, sizeof(message),
-                 "ALERT: SOS activated! Loc: %.4f,%.4f. Map: [https://maps.google.com/?q=%.4f,%.4f] (https://maps.google.com/?q=%.4f,%.4f) Batt: %d%%",
-                 lat, lon, lat, lon, lat, lon, batt >= 0 ? batt : 0);
+                 "ALERT: SOS activated! Loc: %.6f,%.6f. Map: [https://maps.google.com/?q=%.6f,%.6f] (https://maps.google.com/?q=%.6f,%.6f) Batt: %d%%",
+                 fix_info.latitude, fix_info.longitude,
+                 fix_info.latitude, fix_info.longitude,
+                 fix_info.latitude, fix_info.longitude,
+                 batt >= 0 ? batt : 0);
     } else {
-        // fallback to raw GPS info string
-        snprintf(message, sizeof(message), "SOS triggered by %s (%ld). Battery:%d%% GPS: %s",
-                 source ? source : "system", (long)value, batt >= 0 ? batt : -1, trim_response(gps_response).c_str());
+        snprintf(message, sizeof(message),
+                 "ALERT: SOS activated! Loc: unavailable. Map: unavailable Batt: %d%%",
+                 batt >= 0 ? batt : 0);
     }
 
     ESP_LOGI(TAG, "Sending emergency SMS to %s", sms_number);
@@ -698,18 +918,19 @@ extern "C" void gl868_modem_trigger_emergency(const char *source, int32_t value)
         ESP_LOGI(TAG, "Emergency SMS to %s -> %s", r.c_str(), sms_ok ? "sent" : "failed");
         if (sms_ok) any_sent = true;
     }
-    if (!any_sent) {
-        ESP_LOGW(TAG, "Emergency SMS failed for all recipients; aborting call to %s", call_number);
-        return;
+    if (any_sent) {
+        ESP_LOGI(TAG, "Emergency SMS succeeded; waiting before initiating emergency call");
+    } else {
+        ESP_LOGW(TAG, "Emergency SMS failed for all recipients; continuing with independent call attempt");
     }
-
-    ESP_LOGI(TAG, "Emergency SMS succeeded; waiting before initiating emergency call");
     vTaskDelay(pdMS_TO_TICKS(2000));
 
     ESP_LOGI(TAG, "Initiating emergency call to %s", call_number);
+    log_call_preflight();
     const bool call_ok = make_call(call_number);
     if (!call_ok) {
-        ESP_LOGW(TAG, "Emergency call failed for %s", call_number);
+        ESP_LOGW(TAG, "Emergency call not confirmed for %s; it may still have been placed", call_number);
+        log_call_failure_details();
     } else {
         ESP_LOGI(TAG, "Emergency call initiated to %s", call_number);
         vTaskDelay(pdMS_TO_TICKS(2000));
@@ -745,13 +966,26 @@ extern "C" bool gl868_modem_get_gps_coordinates(double *latitude, double *longit
     if (!s_state.initialized || latitude == nullptr || longitude == nullptr) return false;
     std::string gps;
     if (!get_gps_location(&gps)) return false;
-    const bool fixed = parse_latlon_from_cgnsinf(gps, *latitude, *longitude);
-    if (fixed) {
-        ESP_LOGI(TAG, "GPS fix: SUCCESS -> %.6f,%.6f", *latitude, *longitude);
-    } else {
-        ESP_LOGW(TAG, "GPS fix: NOT AVAILABLE -> %s", trim_response(gps).c_str());
+    GpsFixInfo fix;
+    if (!parse_gps_fix_info_from_cgnsinf(gps, fix)) {
+        ESP_LOGW(TAG, "GPS fix: NOT AVAILABLE -> %s", gps_status_line(gps).c_str());
+        return false;
     }
-    return fixed;
+    *latitude = fix.latitude;
+    *longitude = fix.longitude;
+    ESP_LOGI(TAG, "GPS fix: SUCCESS -> %.6f,%.6f (fix_status=%d fix_mode=%d hdop=%.2f sats=%d/%d)",
+             *latitude, *longitude, fix.fix_status, fix.fix_mode, fix.hdop,
+             fix.satellites_used, fix.satellites_in_view);
+    if (fix.hdop > 5.0) {
+        ESP_LOGW(TAG, "GPS fix available but accuracy is low (hdop=%.2f); expect larger position error", fix.hdop);
+    }
+    if (fix.fix_mode == 1) {
+        ESP_LOGW(TAG, "GPS fix is only 2D (fix_mode=1); vertical accuracy may be limited");
+    }
+    if (fix.satellites_used >= 0 && fix.satellites_used < 4) {
+        ESP_LOGW(TAG, "GPS fix uses few satellites (%d); coordinate accuracy may be reduced", fix.satellites_used);
+    }
+    return true;
 }
 
 extern "C" bool gl868_modem_send_geolinker_location(double latitude, double longitude, int battery_percent)
