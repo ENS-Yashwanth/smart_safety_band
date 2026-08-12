@@ -34,10 +34,15 @@ To make this automatic
 9. Build
 	idf.py build
 10. Flash
+	idf.py -p /dev/ttyACM0 flash
 	idf.py flash
 11. Monitor
+	idf.py -p /dev/ttyACM0 monitor
 	idf.py monitor
 12. Cleanup all
 	idf.py fullclean
 13. Execute all at once
 	idf.py fullclean reconfigure build flash monitor
+14. Erase the flash program 
+	idf.py -p /dev/ttyACM0 erase-flash
+	idf.py erase-flash
