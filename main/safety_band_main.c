@@ -108,7 +108,7 @@ static void communication_task(void *argument)
             if (modem_ready) {
                 xEventGroupSetBits(s_system_events, BIT_MODEM_READY);
                 ESP_LOGI(TAG, "SIM868 ready for emergency and GPS services");
-                ESP_LOGI(TAG, "Boot complete. Emergency SMS recipient(s): %s", gl868_modem_get_emergency_sms_number());
+                ESP_LOGI(TAG, "Boot complete. Emergency SMS recipient: %s", gl868_modem_get_emergency_sms_number());
                 ESP_LOGI(TAG, "Boot complete. Emergency call recipient: %s", gl868_modem_get_emergency_call_number());
             } else {
                 ESP_LOGW(TAG, "SIM868 initialization failed; retrying in 15 seconds");
@@ -177,5 +177,5 @@ void app_main(void)
     xTaskCreate(sos_button_task, "sos_button", 2048, NULL, 8, NULL);
     ESP_LOGI(TAG, "SOS button task started on GPIO %d", SOS_BUTTON_GPIO);
     xTaskCreate(gps_task, "gps_upload", 2048, NULL, 4, NULL);
-    ESP_LOGI(TAG, "GPS fix");
+    ESP_LOGI(TAG, "GPS task started for location updates");
 }

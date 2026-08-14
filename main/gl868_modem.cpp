@@ -24,6 +24,13 @@ static const char *DEFAULT_EMERGENCY_CALL_NUMBER = "+916309538622";
 static const char *DEFAULT_EMERGENCY_SMS_NUMBER = "+916309538622";
 static const uint32_t GPS_FIX_RETRY_DELAY_MS = 5000;
 static const int GPS_FIX_RETRY_COUNT = 2;
+// Accuracy thresholds and fallback behavior
+static const double GPS_ACCEPTABLE_HDOP = 2.0; // lower is better
+static const int GPS_MIN_SATELLITES = 4;
+// When metadata is missing or accuracy is poor, apply exponential smoothing to reduce jump/noise
+static const bool GPS_ENABLE_SMOOTHING_FALLBACK = true;
+static const double GPS_SMOOTHING_ALPHA = 0.3; // EMA weight for new value
+
 
 struct Sim868State {
     std::shared_ptr<esp_modem::DTE> dte;
@@ -317,6 +324,72 @@ static bool parse_gps_fix_info_from_cgnsinf(const std::string &cgnsinf, GpsFixIn
     return true;
 }
 
+/* Attempt to gather additional GNSS metadata from other vendor-specific AT responses.
+ * This will try a set of common commands and extract HDOP and satellite counts
+ * when present, merging them into the provided `info` structure.
+ */
+static bool fetch_additional_gnss_metadata(GpsFixInfo &info)
+{
+    bool found_any = false;
+    const char *cmds[] = { "AT+CGNSPVT?\r", "AT+QGPSLOC?\r", "AT+CGPSINFO\r" };
+    for (const char *cmd : cmds) {
+        std::string resp;
+        if (!send_at_command(cmd, &resp, 1500)) continue;
+        const std::string r = trim_response(resp);
+        // Try to parse as CGNSINF-like first
+        GpsFixInfo tmp;
+        if (r.find("+CGNSINF:") != std::string::npos) {
+            if (parse_gps_fix_info_from_cgnsinf(r, tmp)) {
+                if (tmp.hdop > 0.0 && info.hdop <= 0.0) { info.hdop = tmp.hdop; found_any = true; }
+                if (tmp.satellites_used >= 0 && info.satellites_used < tmp.satellites_used) { info.satellites_used = tmp.satellites_used; found_any = true; }
+                if (tmp.satellites_in_view >= 0 && info.satellites_in_view < tmp.satellites_in_view) { info.satellites_in_view = tmp.satellites_in_view; found_any = true; }
+                continue;
+            }
+        }
+
+        // Generic heuristics: look for hdop or sat tokens
+        std::string lower = r;
+        for (char &c : lower) c = static_cast<char>(tolower(c));
+
+        // hdop patterns
+        size_t pos = std::string::npos;
+        const char *hdop_tokens[] = { "hdop", "hdp", "pdop" };
+        for (const char *t : hdop_tokens) {
+            pos = lower.find(t);
+            if (pos != std::string::npos) break;
+        }
+        if (pos != std::string::npos) {
+            // find first number after token
+            size_t i = pos;
+            while (i < lower.size() && !( (lower[i] >= '0' && lower[i] <= '9') || lower[i] == '+' || lower[i] == '-' )) i++;
+            if (i < lower.size()) {
+                char *endp = nullptr;
+                double v = strtod(lower.c_str() + i, &endp);
+                if (endp != nullptr && (lower.c_str() + i) != endp) {
+                    if (v > 0.0 && info.hdop <= 0.0) { info.hdop = v; found_any = true; }
+                }
+            }
+        }
+
+        // satellites patterns
+        const char *sat_tokens[] = { "sat", "sats", "satellites" };
+        pos = std::string::npos;
+        for (const char *t : sat_tokens) {
+            pos = lower.find(t);
+            if (pos != std::string::npos) break;
+        }
+        if (pos != std::string::npos) {
+            size_t i = pos;
+            while (i < lower.size() && !(lower[i] >= '0' && lower[i] <= '9')) i++;
+            if (i < lower.size()) {
+                int v = static_cast<int>(strtol(lower.c_str() + i, nullptr, 10));
+                if (v > 0 && info.satellites_used < v) { info.satellites_used = v; found_any = true; }
+            }
+        }
+    }
+    return found_any;
+}
+
 static bool is_valid_coordinate(double latitude, double longitude)
 {
     if (latitude == 0.0 && longitude == 0.0) {
@@ -393,8 +466,49 @@ static bool wait_for_gps_fix(GpsFixInfo &info, uint32_t timeout_ms)
             continue;
         }
 
-        ESP_LOGI(TAG, "GPS fix obtained: %.6f, %.6f (sats=%d, hdop=%.2f)",
-                 info.latitude, info.longitude, info.satellites_used, info.hdop);
+        /* Try to fetch richer GNSS metadata (GGA) to get HDOP and satellite counts when possible. */
+        {
+            std::string saved_seq;
+            std::string resp;
+            if (send_at_command("AT+CGNSSEQ?\r", &resp, 1000)) {
+                saved_seq = trim_response(resp);
+            }
+
+            /* Request GGA which often includes HDOP and satellite counts */
+            send_at_command("AT+CGNSSEQ=\"GGA\"\r", &resp, 1000);
+            vTaskDelay(pdMS_TO_TICKS(500));
+
+            std::string meta_resp;
+            GpsFixInfo meta_info;
+            if (get_gps_location(&meta_resp, 3000) && parse_gps_fix_info_from_cgnsinf(meta_resp, meta_info)) {
+                if (meta_info.hdop > 0.0) info.hdop = meta_info.hdop;
+                if (meta_info.satellites_used >= 0) info.satellites_used = meta_info.satellites_used;
+                if (meta_info.satellites_in_view >= 0) info.satellites_in_view = meta_info.satellites_in_view;
+            }
+
+            /* If still missing or incomplete metadata, try other vendor-specific commands */
+            if ((info.hdop <= 0.0 || info.satellites_used <= 0) && fetch_additional_gnss_metadata(info)) {
+                ESP_LOGI(TAG, "GPS fix obtained (from supplemental metadata): %.6f, %.6f (sats=%d/%d, hdop=%.2f)",
+                         info.latitude, info.longitude, info.satellites_used, info.satellites_in_view, info.hdop);
+            } else if (info.hdop > 0.0 || info.satellites_used > 0) {
+                ESP_LOGI(TAG, "GPS fix obtained (partial metadata): %.6f, %.6f (hdop=%.2f, sats=%d)",
+                         info.latitude, info.longitude, info.hdop, info.satellites_used);
+            } else {
+                ESP_LOGI(TAG, "GPS fix obtained (no rich metadata): %.6f, %.6f (hdop=%.2f, sats=%d)",
+                         info.latitude, info.longitude, info.hdop, info.satellites_used);
+            }
+
+            /* Restore previous sequence if available */
+            if (!saved_seq.empty()) {
+                size_t q1 = saved_seq.find('"');
+                size_t q2 = (q1 == std::string::npos) ? std::string::npos : saved_seq.find('"', q1 + 1);
+                if (q1 != std::string::npos && q2 != std::string::npos && q2 > q1) {
+                    std::string seqval = saved_seq.substr(q1, q2 - q1 + 1); // includes quotes
+                    std::string restore_cmd = std::string("AT+CGNSSEQ=") + seqval + "\r";
+                    send_at_command(restore_cmd, &resp, 1000);
+                }
+            }
+        }
         return true;
     }
 
@@ -1106,6 +1220,34 @@ extern "C" bool gl868_modem_get_gps_coordinates(double *latitude, double *longit
     if (fix.fix_status <= 0) {
         ESP_LOGW(TAG, "GPS fix unavailable: run=%d fix_status=%d timestamp=%s", fix.run_status, fix.fix_status, fix.timestamp.c_str());
         return false;
+    }
+
+    bool poor_metadata = (fix.hdop <= 0.0 || fix.hdop > GPS_ACCEPTABLE_HDOP || fix.satellites_used < GPS_MIN_SATELLITES);
+
+    if (poor_metadata && GPS_ENABLE_SMOOTHING_FALLBACK) {
+        static double last_lat = 0.0;
+        static double last_lon = 0.0;
+        static bool have_last = false;
+        double out_lat = fix.latitude;
+        double out_lon = fix.longitude;
+
+        if (!have_last) {
+            last_lat = fix.latitude;
+            last_lon = fix.longitude;
+            have_last = true;
+            ESP_LOGW(TAG, "GPS metadata poor (hdop=%.2f sats=%d); using first value as baseline", fix.hdop, fix.satellites_used);
+        } else {
+            out_lat = GPS_SMOOTHING_ALPHA * fix.latitude + (1.0 - GPS_SMOOTHING_ALPHA) * last_lat;
+            out_lon = GPS_SMOOTHING_ALPHA * fix.longitude + (1.0 - GPS_SMOOTHING_ALPHA) * last_lon;
+            last_lat = out_lat;
+            last_lon = out_lon;
+            ESP_LOGW(TAG, "GPS metadata poor (hdop=%.2f sats=%d); returning smoothed coord", fix.hdop, fix.satellites_used);
+        }
+
+        *latitude = out_lat;
+        *longitude = out_lon;
+        ESP_LOGI(TAG, "GPS fix: SUCCESS -> %.6f,%.6f (smoothed, hdop=%.2f, sats=%d)", *latitude, *longitude, fix.hdop, fix.satellites_used);
+        return true;
     }
 
     *latitude = fix.latitude;
