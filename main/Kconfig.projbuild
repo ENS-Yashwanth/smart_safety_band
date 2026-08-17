@@ -24,6 +24,33 @@ menu "Smart Safety Band configuration"
             available. The real accelerometer is always preferred; only absent
             health/environment modules produce clearly labelled simulated data.
 
+    config SAFETY_BAND_POWER_MANAGEMENT
+        bool "Enable automatic light sleep and dynamic CPU frequency"
+        default y
+        help
+            Enables ESP32-S3 automatic light sleep whenever all application
+            tasks are blocked. Modem transactions hold a power-management lock
+            so UART communication is never interrupted. Requires CONFIG_PM_ENABLE
+            and CONFIG_FREERTOS_USE_TICKLESS_IDLE.
+
+    config SAFETY_BAND_PM_MIN_FREQ_MHZ
+        int "Minimum idle CPU frequency (MHz)"
+        depends on SAFETY_BAND_POWER_MANAGEMENT
+        range 10 160
+        default 40
+        help
+            CPU frequency used while no power-management locks are held.
+            40 MHz provides a conservative balance between battery life and
+            wake-up responsiveness for the SOS workflow.
+
+    config SAFETY_BAND_GNSS_POWER_SAVE
+        bool "Turn GNSS off between location requests"
+        default y
+        help
+            Powers the SIM868 GNSS engine on only when a GPS fix is requested
+            and turns it off after modem work completes. This saves battery but
+            can make the next GPS fix slower than continuous GNSS operation.
+
     config SAFETY_BAND_EMERGENCY_CALL_NUMBER
         string "Emergency call number"
         default "+916309538622"

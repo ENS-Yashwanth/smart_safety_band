@@ -15,6 +15,7 @@ bool gl868_modem_send_sms_to(const char *number, const char *message);
 bool gl868_modem_make_call_to(const char *number);
 bool gl868_modem_get_gps_now(char *buf, size_t buf_len);
 bool gl868_modem_get_gps_coordinates(double *latitude, double *longitude);
+bool gl868_modem_set_gnss_power(bool enabled);
 const char *gl868_modem_get_emergency_call_number(void);
 const char *gl868_modem_get_emergency_sms_number(void);
 int gl868_modem_get_battery_percent(void);
