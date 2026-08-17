@@ -19,6 +19,14 @@ const char *gl868_modem_get_emergency_call_number(void);
 const char *gl868_modem_get_emergency_sms_number(void);
 int gl868_modem_get_battery_percent(void);
 void gl868_modem_request_deferred_gps_upload(void);
+void gl868_modem_set_movement_profile(int profile);
+
+#define GL868_PROFILE_STATIONARY 0
+#define GL868_PROFILE_WALKING 1
+#define GL868_PROFILE_RUNNING 2
+
+// Set low-level Kalman params directly: process noise (q) and initial variance (var)
+void gl868_modem_set_kalman_params(double q_lat, double q_lon, double var_lat, double var_lon);
 
 #ifdef __cplusplus
 }

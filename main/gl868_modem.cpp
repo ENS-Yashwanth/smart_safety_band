@@ -3,6 +3,9 @@
 #include <cstring>
 #include <cstdio>
 #include <vector>
+#include <array>
+#include <cmath>
+#include <ctime>
 
 #include "driver/gpio.h"
 #include "driver/uart.h"
@@ -27,9 +30,11 @@ static const int GPS_FIX_RETRY_COUNT = 2;
 // Accuracy thresholds and fallback behavior
 static const double GPS_ACCEPTABLE_HDOP = 2.0; // lower is better
 static const int GPS_MIN_SATELLITES = 4;
-// When metadata is missing or accuracy is poor, apply exponential smoothing to reduce jump/noise
+// When metadata is missing or accuracy is poor, enable smoothing/fallback behavior
 static const bool GPS_ENABLE_SMOOTHING_FALLBACK = true;
-static const double GPS_SMOOTHING_ALPHA = 0.3; // EMA weight for new value
+static const double GPS_SMOOTHING_ALPHA = 0.3; // legacy EMA weight (kept for tuning)
+static const double GPS_HDOP_TO_METERS = 2.0; // rough multiplier: accuracy (m) ~= hdop * UERE(~5m)
+static const int NETWORK_FALLBACK_MAX_ACCURACY_METERS = 100; // accept network fallback if estimated <= this
 
 
 struct Sim868State {
@@ -86,6 +91,139 @@ static bool run_at_step(const char *label, const std::string &command, uint32_t 
 static bool enable_gps(void);
 static bool get_gps_location(std::string *response, uint32_t timeout_ms = 5000);
 static bool is_valid_coordinate(double latitude, double longitude);
+static double hdop_to_estimated_meters(double hdop);
+static bool fetch_network_location(GpsFixInfo &info, uint32_t timeout_ms);
+static double parse_gnss_timestamp_seconds(const std::string &ts);
+// Constant-velocity 2D Kalman filter: state = [lat, lon, v_lat, v_lon]
+struct KalmanCV2D {
+    bool initialized = false;
+    double x[4]; // state
+    double P[4][4]; // covariance
+    double Q[4][4]; // process noise
+
+    void reset()
+    {
+        initialized = false;
+        for (int i = 0; i < 4; ++i) { x[i] = 0.0; for (int j = 0; j < 4; ++j) { P[i][j] = 0.0; Q[i][j] = 0.0; } }
+    }
+
+    void init(double lat, double lon, double meas_var)
+    {
+        reset();
+        x[0] = lat; x[1] = lon; x[2] = 0.0; x[3] = 0.0;
+        // initial covariance: position from measurement var, velocity large
+        P[0][0] = meas_var; P[1][1] = meas_var; P[2][2] = 1.0; P[3][3] = 1.0;
+        initialized = true;
+    }
+
+    void set_process_noise(double pos_q, double vel_q)
+    {
+        // Q diagonal approximating position & velocity process noise
+        for (int i = 0; i < 4; ++i) for (int j = 0; j < 4; ++j) Q[i][j] = 0.0;
+        Q[0][0] = pos_q; Q[1][1] = pos_q; Q[2][2] = vel_q; Q[3][3] = vel_q;
+    }
+
+    void predict(double dt)
+    {
+        if (!initialized) return;
+        double F[4][4] = { {1,0,dt,0}, {0,1,0,dt}, {0,0,1,0}, {0,0,0,1} };
+        double xnew[4] = {0};
+        for (int i = 0; i < 4; ++i) {
+            for (int j = 0; j < 4; ++j) xnew[i] += F[i][j] * x[j];
+        }
+        double Pnew[4][4] = {0};
+        // Pnew = F*P*F^T + Q
+        for (int i = 0; i < 4; ++i) for (int j = 0; j < 4; ++j) {
+            double sum = 0.0;
+            for (int k = 0; k < 4; ++k) for (int l = 0; l < 4; ++l) sum += F[i][k] * P[k][l] * F[j][l];
+            Pnew[i][j] = sum + Q[i][j];
+        }
+        for (int i = 0; i < 4; ++i) { x[i] = xnew[i]; for (int j = 0; j < 4; ++j) P[i][j] = Pnew[i][j]; }
+    }
+
+    void update(double meas_lat, double meas_lon, double meas_var)
+    {
+        if (!initialized) { init(meas_lat, meas_lon, meas_var); return; }
+        // H = [ [1,0,0,0], [0,1,0,0] ]
+        double Ht[4][2] = { {1,0}, {0,1}, {0,0}, {0,0} };
+        // S = H*P*Ht + R
+        double S[2][2] = {0};
+        for (int i = 0; i < 2; ++i) for (int j = 0; j < 2; ++j) {
+            double sum = 0.0;
+            for (int k = 0; k < 4; ++k) for (int l = 0; l < 4; ++l) sum += Ht[k][i] * P[k][l] * Ht[l][j];
+            S[i][j] = sum;
+        }
+        S[0][0] += meas_var; S[1][1] += meas_var;
+        // Compute Kalman gain K = P * H^T * inv(S)
+        // First compute PHT (4x2)
+        double PHT[4][2] = {0};
+        for (int i = 0; i < 4; ++i) for (int j = 0; j < 2; ++j) for (int k = 0; k < 4; ++k) PHT[i][j] += P[i][k] * Ht[k][j];
+        // invert S (2x2)
+        double det = S[0][0]*S[1][1] - S[0][1]*S[1][0];
+        double Sinv[2][2] = {0};
+        if (fabs(det) < 1e-12) {
+            Sinv[0][0] = 1.0 / (S[0][0] + 1e-12);
+            Sinv[1][1] = 1.0 / (S[1][1] + 1e-12);
+        } else {
+            Sinv[0][0] = S[1][1] / det; Sinv[0][1] = -S[0][1] / det;
+            Sinv[1][0] = -S[1][0] / det; Sinv[1][1] = S[0][0] / det;
+        }
+        double K[4][2] = {0};
+        for (int i = 0; i < 4; ++i) for (int j = 0; j < 2; ++j) for (int k = 0; k < 2; ++k) K[i][j] += PHT[i][k] * Sinv[k][j];
+        // y = z - H*x
+        double z[2] = { meas_lat, meas_lon };
+        double Hx[2] = { x[0], x[1] };
+        double y[2] = { z[0] - Hx[0], z[1] - Hx[1] };
+        // x = x + K*y
+        for (int i = 0; i < 4; ++i) for (int j = 0; j < 2; ++j) x[i] += K[i][j] * y[j];
+        // P = (I - K*H) * P
+        double KH[4][4] = {0};
+        for (int i = 0; i < 4; ++i) for (int j = 0; j < 4; ++j) for (int k = 0; k < 2; ++k) KH[i][j] += K[i][k] * Ht[j][k];
+        double IminusKH[4][4];
+        for (int i = 0; i < 4; ++i) for (int j = 0; j < 4; ++j) IminusKH[i][j] = ((i==j)?1.0:0.0) - KH[i][j];
+        double Pnew[4][4] = {0};
+        for (int i = 0; i < 4; ++i) for (int j = 0; j < 4; ++j) for (int k = 0; k < 4; ++k) Pnew[i][j] += IminusKH[i][k] * P[k][j];
+        for (int i = 0; i < 4; ++i) for (int j = 0; j < 4; ++j) P[i][j] = Pnew[i][j];
+    }
+};
+
+static KalmanCV2D s_kf;
+static double s_last_fix_time = 0.0;
+
+enum MovementProfile {
+    MP_STATIONARY = 0,
+    MP_WALKING = 1,
+    MP_RUNNING = 2,
+};
+
+static void set_kalman_profile(int profile)
+{
+    double pos_q = 1e-8; // degrees^2 process noise for position
+    double vel_q = 1e-8; // degrees^2 process noise for velocity
+    double pos_var = 1e-8; // initial position variance (deg^2)
+    double vel_var = 1e-6; // initial velocity variance
+    if (profile == MP_STATIONARY) {
+        pos_q = 1e-10; vel_q = 1e-10; pos_var = 4e-10; vel_var = 1e-8;
+    } else if (profile == MP_WALKING) {
+        pos_q = 5e-9; vel_q = 5e-8; pos_var = 8e-9; vel_var = 8e-11;
+    } else if (profile == MP_RUNNING) {
+        pos_q = 2e-8; vel_q = 5e-7; pos_var = 3e-8; vel_var = 7e-10;
+    } else {
+        pos_q = 5e-9; vel_q = 5e-8; pos_var = 1e-8; vel_var = 1e-10;
+    }
+    // reset then set process noise and seed covariance diagonals
+    s_kf.reset();
+    s_kf.set_process_noise(pos_q, vel_q);
+    s_kf.P[0][0] = pos_var; s_kf.P[1][1] = pos_var; s_kf.P[2][2] = vel_var; s_kf.P[3][3] = vel_var;
+}
+
+extern "C" void gl868_modem_set_kalman_params(double q_lat, double q_lon, double var_lat, double var_lon)
+{
+    s_kf.reset();
+    s_kf.set_process_noise(q_lat, q_lon);
+    s_kf.P[0][0] = var_lat; s_kf.P[1][1] = var_lon; s_kf.P[2][2] = 1.0; s_kf.P[3][3] = 1.0;
+    ESP_LOGI(TAG, "Kalman params set: pos_q=%.6g vel_q=%.6g pos_var=%.6g vel_var=%.6g", q_lat, q_lon, var_lat, var_lon);
+}
 static bool wait_for_sim_ready(uint32_t timeout_ms = 15000);
 static bool ensure_apn_configured(void);
 
@@ -324,72 +462,6 @@ static bool parse_gps_fix_info_from_cgnsinf(const std::string &cgnsinf, GpsFixIn
     return true;
 }
 
-/* Attempt to gather additional GNSS metadata from other vendor-specific AT responses.
- * This will try a set of common commands and extract HDOP and satellite counts
- * when present, merging them into the provided `info` structure.
- */
-static bool fetch_additional_gnss_metadata(GpsFixInfo &info)
-{
-    bool found_any = false;
-    const char *cmds[] = { "AT+CGNSPVT?\r", "AT+QGPSLOC?\r", "AT+CGPSINFO\r" };
-    for (const char *cmd : cmds) {
-        std::string resp;
-        if (!send_at_command(cmd, &resp, 1500)) continue;
-        const std::string r = trim_response(resp);
-        // Try to parse as CGNSINF-like first
-        GpsFixInfo tmp;
-        if (r.find("+CGNSINF:") != std::string::npos) {
-            if (parse_gps_fix_info_from_cgnsinf(r, tmp)) {
-                if (tmp.hdop > 0.0 && info.hdop <= 0.0) { info.hdop = tmp.hdop; found_any = true; }
-                if (tmp.satellites_used >= 0 && info.satellites_used < tmp.satellites_used) { info.satellites_used = tmp.satellites_used; found_any = true; }
-                if (tmp.satellites_in_view >= 0 && info.satellites_in_view < tmp.satellites_in_view) { info.satellites_in_view = tmp.satellites_in_view; found_any = true; }
-                continue;
-            }
-        }
-
-        // Generic heuristics: look for hdop or sat tokens
-        std::string lower = r;
-        for (char &c : lower) c = static_cast<char>(tolower(c));
-
-        // hdop patterns
-        size_t pos = std::string::npos;
-        const char *hdop_tokens[] = { "hdop", "hdp", "pdop" };
-        for (const char *t : hdop_tokens) {
-            pos = lower.find(t);
-            if (pos != std::string::npos) break;
-        }
-        if (pos != std::string::npos) {
-            // find first number after token
-            size_t i = pos;
-            while (i < lower.size() && !( (lower[i] >= '0' && lower[i] <= '9') || lower[i] == '+' || lower[i] == '-' )) i++;
-            if (i < lower.size()) {
-                char *endp = nullptr;
-                double v = strtod(lower.c_str() + i, &endp);
-                if (endp != nullptr && (lower.c_str() + i) != endp) {
-                    if (v > 0.0 && info.hdop <= 0.0) { info.hdop = v; found_any = true; }
-                }
-            }
-        }
-
-        // satellites patterns
-        const char *sat_tokens[] = { "sat", "sats", "satellites" };
-        pos = std::string::npos;
-        for (const char *t : sat_tokens) {
-            pos = lower.find(t);
-            if (pos != std::string::npos) break;
-        }
-        if (pos != std::string::npos) {
-            size_t i = pos;
-            while (i < lower.size() && !(lower[i] >= '0' && lower[i] <= '9')) i++;
-            if (i < lower.size()) {
-                int v = static_cast<int>(strtol(lower.c_str() + i, nullptr, 10));
-                if (v > 0 && info.satellites_used < v) { info.satellites_used = v; found_any = true; }
-            }
-        }
-    }
-    return found_any;
-}
-
 static bool is_valid_coordinate(double latitude, double longitude)
 {
     if (latitude == 0.0 && longitude == 0.0) {
@@ -404,7 +476,7 @@ static bool is_valid_coordinate(double latitude, double longitude)
     return true;
 }
 
-static bool wait_for_gps_fix(GpsFixInfo &info, uint32_t timeout_ms)
+static __attribute__((unused)) bool wait_for_gps_fix(GpsFixInfo &info, uint32_t timeout_ms)
 {
     if (!s_state.gps_enabled && !enable_gps()) {
         ESP_LOGW(TAG, "GPS power enable failed before fix attempt");
@@ -466,49 +538,8 @@ static bool wait_for_gps_fix(GpsFixInfo &info, uint32_t timeout_ms)
             continue;
         }
 
-        /* Try to fetch richer GNSS metadata (GGA) to get HDOP and satellite counts when possible. */
-        {
-            std::string saved_seq;
-            std::string resp;
-            if (send_at_command("AT+CGNSSEQ?\r", &resp, 1000)) {
-                saved_seq = trim_response(resp);
-            }
-
-            /* Request GGA which often includes HDOP and satellite counts */
-            send_at_command("AT+CGNSSEQ=\"GGA\"\r", &resp, 1000);
-            vTaskDelay(pdMS_TO_TICKS(500));
-
-            std::string meta_resp;
-            GpsFixInfo meta_info;
-            if (get_gps_location(&meta_resp, 3000) && parse_gps_fix_info_from_cgnsinf(meta_resp, meta_info)) {
-                if (meta_info.hdop > 0.0) info.hdop = meta_info.hdop;
-                if (meta_info.satellites_used >= 0) info.satellites_used = meta_info.satellites_used;
-                if (meta_info.satellites_in_view >= 0) info.satellites_in_view = meta_info.satellites_in_view;
-            }
-
-            /* If still missing or incomplete metadata, try other vendor-specific commands */
-            if ((info.hdop <= 0.0 || info.satellites_used <= 0) && fetch_additional_gnss_metadata(info)) {
-                ESP_LOGI(TAG, "GPS fix obtained (from supplemental metadata): %.6f, %.6f (sats=%d/%d, hdop=%.2f)",
-                         info.latitude, info.longitude, info.satellites_used, info.satellites_in_view, info.hdop);
-            } else if (info.hdop > 0.0 || info.satellites_used > 0) {
-                ESP_LOGI(TAG, "GPS fix obtained (partial metadata): %.6f, %.6f (hdop=%.2f, sats=%d)",
-                         info.latitude, info.longitude, info.hdop, info.satellites_used);
-            } else {
-                ESP_LOGI(TAG, "GPS fix obtained (no rich metadata): %.6f, %.6f (hdop=%.2f, sats=%d)",
-                         info.latitude, info.longitude, info.hdop, info.satellites_used);
-            }
-
-            /* Restore previous sequence if available */
-            if (!saved_seq.empty()) {
-                size_t q1 = saved_seq.find('"');
-                size_t q2 = (q1 == std::string::npos) ? std::string::npos : saved_seq.find('"', q1 + 1);
-                if (q1 != std::string::npos && q2 != std::string::npos && q2 > q1) {
-                    std::string seqval = saved_seq.substr(q1, q2 - q1 + 1); // includes quotes
-                    std::string restore_cmd = std::string("AT+CGNSSEQ=") + seqval + "\r";
-                    send_at_command(restore_cmd, &resp, 1000);
-                }
-            }
-        }
+        ESP_LOGI(TAG, "GPS fix obtained: %.6f, %.6f (sats=%d, hdop=%.2f)",
+                 info.latitude, info.longitude, info.satellites_used, info.hdop);
         return true;
     }
 
@@ -566,7 +597,7 @@ static __attribute__((unused)) bool log_network_registration(void)
     return registered;
 }
 
-static bool is_network_registered(void)
+static __attribute__((unused)) bool is_network_registered(void)
 {
     std::string response;
     if (send_at_command("AT+CREG?\r", &response, 5000)) {
@@ -843,11 +874,13 @@ bool enable_gps(void)
         return false;
     }
     ESP_LOGI(TAG, "GPS power on: SUCCESS");
-    if (!send_at_command("AT+CGNSSEQ=\"RMC\"\r", &response, 3000)) {
-        ESP_LOGW(TAG, "GPS RMC configuration: FAILED -> %s", trim_response(response).c_str());
-        return false;
+    // Request richer GNSS outputs (GGA/GSA/GSV/RMC) so HDOP and satellite info
+    // are available when the modem supports them. Failure is non-fatal.
+    if (!send_at_command("AT+CGNSSEQ=\"GGA\",\"GSA\",\"GSV\",\"RMC\"\r", &response, 3000)) {
+        ESP_LOGW(TAG, "GPS sequence configuration failed -> %s", trim_response(response).c_str());
+    } else {
+        ESP_LOGI(TAG, "GPS sequence configured for richer metadata");
     }
-    ESP_LOGI(TAG, "GPS RMC configuration: SUCCESS");
     return true;
 }
 
@@ -860,6 +893,95 @@ bool get_gps_location(std::string *response, uint32_t timeout_ms)
     }
     if (!ok) ESP_LOGW(TAG, "GPS query: FAILED (%s)", gps_status_line(gps_response).c_str());
     return ok;
+}
+
+static double hdop_to_estimated_meters(double hdop)
+{
+    if (hdop <= 0.0) return 1e6;
+    return hdop * GPS_HDOP_TO_METERS;
+}
+
+static bool fetch_network_location(GpsFixInfo &info, uint32_t timeout_ms)
+{
+    const char *cmds[] = { "AT+CIPGSMLOC=1,1\r", "AT+CLBS=1,1\r", "AT+CLBS?\r" };
+    for (const char *cmd : cmds) {
+        std::string resp;
+        if (!send_at_command(cmd, &resp, timeout_ms)) continue;
+        std::string r = trim_response(resp);
+        size_t i = 0;
+        std::vector<double> nums;
+        while (i < r.size()) {
+            while (i < r.size() && !((r[i] >= '0' && r[i] <= '9') || r[i] == '+' || r[i] == '-')) i++;
+            if (i >= r.size()) break;
+            char *endp = nullptr;
+            double v = strtod(r.c_str() + i, &endp);
+            if (endp != nullptr && (r.c_str() + i) != endp) {
+                nums.push_back(v);
+                i = static_cast<size_t>(endp - r.c_str());
+            } else {
+                i++;
+            }
+            if (nums.size() >= 3) break;
+        }
+        if (nums.size() >= 2) {
+            GpsFixInfo net;
+            net.latitude = nums[0];
+            net.longitude = nums[1];
+            net.valid = is_valid_coordinate(net.latitude, net.longitude);
+            if (!net.valid) continue;
+            if (nums.size() >= 3) {
+                double acc = nums[2];
+                if (acc > 0.0) net.hdop = acc / GPS_HDOP_TO_METERS;
+            }
+            info.latitude = net.latitude;
+            info.longitude = net.longitude;
+            if (net.hdop > 0.0) info.hdop = net.hdop;
+            info.valid = true;
+            return true;
+        }
+    }
+    return false;
+}
+
+static double parse_gnss_timestamp_seconds(const std::string &ts)
+{
+    if (ts.empty()) return 0.0;
+    // Expected format: YYYYMMDDhhmmss(.sss) or YYYY/MM/DD hh:mm:ss
+    // Try to extract year,month,day,hour,min,sec,fraction
+    int year=0, mon=0, day=0, hour=0, min=0;
+    double sec_f = 0.0;
+    // compact format YYYYMMDDhhmmss.sss
+    if (ts.size() >= 14 && isdigit(static_cast<unsigned char>(ts[0]))) {
+        year = atoi(ts.substr(0,4).c_str());
+        mon  = atoi(ts.substr(4,2).c_str());
+        day  = atoi(ts.substr(6,2).c_str());
+        hour = atoi(ts.substr(8,2).c_str());
+        min  = atoi(ts.substr(10,2).c_str());
+        sec_f = atof(ts.substr(12).c_str());
+    } else {
+        // fallback: try to parse tokens for hh:mm:ss or digits
+        int scanned = sscanf(ts.c_str(), "%d-%d-%d %d:%d:%lf", &year, &mon, &day, &hour, &min, &sec_f);
+        if (scanned < 6) scanned = sscanf(ts.c_str(), "%d/%d/%d %d:%d:%lf", &year, &mon, &day, &hour, &min, &sec_f);
+        if (scanned < 6) return 0.0;
+    }
+
+    struct tm t;
+    std::memset(&t, 0, sizeof(t));
+    t.tm_year = year - 1900;
+    t.tm_mon = mon - 1;
+    t.tm_mday = day;
+    t.tm_hour = hour;
+    t.tm_min = min;
+    t.tm_sec = static_cast<int>(floor(sec_f));
+    // Use timegm if available to get UTC seconds; fall back to mktime (localtime) if not.
+#if defined(__USE_MISC) || defined(_GNU_SOURCE)
+    time_t s = timegm(&t);
+#else
+    time_t s = mktime(&t);
+#endif
+    if (s == (time_t)-1) return 0.0;
+    double frac = sec_f - floor(sec_f);
+    return static_cast<double>(s) + frac;
 }
 
 __attribute__((unused)) bool run_at_step(const char *label, const std::string &command, uint32_t timeout_ms, const char *success_marker)
@@ -1225,27 +1347,106 @@ extern "C" bool gl868_modem_get_gps_coordinates(double *latitude, double *longit
     bool poor_metadata = (fix.hdop <= 0.0 || fix.hdop > GPS_ACCEPTABLE_HDOP || fix.satellites_used < GPS_MIN_SATELLITES);
 
     if (poor_metadata && GPS_ENABLE_SMOOTHING_FALLBACK) {
-        static double last_lat = 0.0;
-        static double last_lon = 0.0;
-        static bool have_last = false;
-        double out_lat = fix.latitude;
-        double out_lon = fix.longitude;
+        // use global Kalman state so tuning persists across calls
+        KalmanCV2D &kf = s_kf;
 
-        if (!have_last) {
-            last_lat = fix.latitude;
-            last_lon = fix.longitude;
-            have_last = true;
-            ESP_LOGW(TAG, "GPS metadata poor (hdop=%.2f sats=%d); using first value as baseline", fix.hdop, fix.satellites_used);
-        } else {
-            out_lat = GPS_SMOOTHING_ALPHA * fix.latitude + (1.0 - GPS_SMOOTHING_ALPHA) * last_lat;
-            out_lon = GPS_SMOOTHING_ALPHA * fix.longitude + (1.0 - GPS_SMOOTHING_ALPHA) * last_lon;
-            last_lat = out_lat;
-            last_lon = out_lon;
-            ESP_LOGW(TAG, "GPS metadata poor (hdop=%.2f sats=%d); returning smoothed coord", fix.hdop, fix.satellites_used);
+        // 1) Try network-based coarse location and accept if its estimated accuracy is reasonable.
+        GpsFixInfo netinfo;
+        if (fetch_network_location(netinfo, 3000)) {
+            double net_acc_m = (netinfo.hdop > 0.0) ? hdop_to_estimated_meters(netinfo.hdop) : NETWORK_FALLBACK_MAX_ACCURACY_METERS;
+            if (net_acc_m <= NETWORK_FALLBACK_MAX_ACCURACY_METERS) {
+                double meas_std_deg = net_acc_m / 111320.0;
+                double meas_var = meas_std_deg * meas_std_deg;
+                // compute variable dt from last GNSS fix timestamp when available
+                double dt = 0.5;
+                double curt = parse_gnss_timestamp_seconds(fix.timestamp);
+                if (curt > 0.0 && s_last_fix_time > 0.0) {
+                    double d = curt - s_last_fix_time;
+                    if (d > 0.0 && d < 60.0) dt = d;
+                }
+                if (curt > 0.0) s_last_fix_time = curt;
+                kf.predict(dt);
+                kf.update(netinfo.latitude, netinfo.longitude, meas_var);
+                *latitude = kf.x[0];
+                *longitude = kf.x[1];
+                ESP_LOGW(TAG, "Using network fallback location (est acc=%.1fm): %.6f,%.6f", net_acc_m, *latitude, *longitude);
+                return true;
+            }
         }
 
-        *latitude = out_lat;
-        *longitude = out_lon;
+        // 2) Collect multiple GNSS samples and compute a robust estimate (weighted average by 1/hdop^2)
+        const int sample_count = 6;
+        std::vector<GpsFixInfo> samples;
+        for (int i = 0; i < sample_count; ++i) {
+            std::string resp;
+            if (!get_gps_location(&resp, 3000)) {
+                vTaskDelay(pdMS_TO_TICKS(500));
+                continue;
+            }
+            GpsFixInfo s;
+            if (!parse_gps_fix_info_from_cgnsinf(resp, s)) {
+                vTaskDelay(pdMS_TO_TICKS(300));
+                continue;
+            }
+            if (s.fix_status <= 0 || !is_valid_coordinate(s.latitude, s.longitude)) continue;
+            samples.push_back(s);
+            vTaskDelay(pdMS_TO_TICKS(400));
+        }
+
+        if (!samples.empty()) {
+            double wsum = 0.0, lat_sum = 0.0, lon_sum = 0.0;
+            double hdop_sum = 0.0;
+            for (const auto &si : samples) {
+                double w = 1.0;
+                if (si.hdop > 0.0) w = 1.0 / (si.hdop * si.hdop);
+                lat_sum += si.latitude * w;
+                lon_sum += si.longitude * w;
+                wsum += w;
+                hdop_sum += (si.hdop > 0.0) ? si.hdop : GPS_ACCEPTABLE_HDOP;
+            }
+            double avg_lat = lat_sum / wsum;
+            double avg_lon = lon_sum / wsum;
+            double avg_hdop = hdop_sum / static_cast<double>(samples.size());
+
+            double meas_m = hdop_to_estimated_meters(avg_hdop);
+            double meas_std_deg = meas_m / 111320.0;
+            double meas_var = meas_std_deg * meas_std_deg;
+            // compute dt from last sample timestamp when available
+            double dt = 0.5;
+            if (!samples.empty()) {
+                double curt = parse_gnss_timestamp_seconds(samples.back().timestamp);
+                if (curt > 0.0 && s_last_fix_time > 0.0) {
+                    double d = curt - s_last_fix_time;
+                    if (d > 0.0 && d < 60.0) dt = d;
+                }
+                if (curt > 0.0) s_last_fix_time = curt;
+            }
+            kf.predict(dt);
+            kf.update(avg_lat, avg_lon, meas_var);
+            *latitude = kf.x[0];
+            *longitude = kf.x[1];
+            ESP_LOGW(TAG, "GPS poor metadata: returning multi-sample Kalman estimate (samples=%d avg_hdop=%.2f est_m=%.1fm)", (int)samples.size(), avg_hdop, meas_m);
+            ESP_LOGI(TAG, "GPS fix: SUCCESS -> %.6f,%.6f (smoothed, est_m=%.1fm, samples=%d)", *latitude, *longitude, meas_m, (int)samples.size());
+            return true;
+        }
+
+        // 3) No good alternate samples — fall back to using the single measurement in Kalman
+        double meas_m = hdop_to_estimated_meters(fix.hdop);
+        if (meas_m > 1e5) meas_m = 200.0;
+        double meas_std_deg = meas_m / 111320.0;
+        double meas_var = meas_std_deg * meas_std_deg;
+        double dt = 0.5;
+        double curt = parse_gnss_timestamp_seconds(fix.timestamp);
+        if (curt > 0.0 && s_last_fix_time > 0.0) {
+            double d = curt - s_last_fix_time;
+            if (d > 0.0 && d < 60.0) dt = d;
+        }
+        if (curt > 0.0) s_last_fix_time = curt;
+        kf.predict(dt);
+        kf.update(fix.latitude, fix.longitude, meas_var);
+        *latitude = kf.x[0];
+        *longitude = kf.x[1];
+        ESP_LOGW(TAG, "GPS metadata poor (hdop=%.2f sats=%d); returning Kalman-smoothed coord (meas_m=%.1fm)", fix.hdop, fix.satellites_used, meas_m);
         ESP_LOGI(TAG, "GPS fix: SUCCESS -> %.6f,%.6f (smoothed, hdop=%.2f, sats=%d)", *latitude, *longitude, fix.hdop, fix.satellites_used);
         return true;
     }
@@ -1255,6 +1456,12 @@ extern "C" bool gl868_modem_get_gps_coordinates(double *latitude, double *longit
     ESP_LOGI(TAG, "GPS fix: SUCCESS -> %.6f,%.6f (hdop=%.2f, sats=%d)",
              fix.latitude, fix.longitude, fix.hdop, fix.satellites_used);
     return true;
+}
+
+extern "C" void gl868_modem_set_movement_profile(int profile)
+{
+    set_kalman_profile(profile);
+    ESP_LOGI(TAG, "Movement profile set: %d", profile);
 }
 
 extern "C" const char *gl868_modem_get_emergency_call_number(void)
