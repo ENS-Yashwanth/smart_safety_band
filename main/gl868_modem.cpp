@@ -89,7 +89,6 @@ static const char *get_emergency_sms_number(void);
 static std::vector<std::string> split_recipients(const std::string &list);
 static bool run_at_step(const char *label, const std::string &command, uint32_t timeout_ms, const char *success_marker = nullptr);
 static bool enable_gps(void);
-static bool disable_gps(void);
 static bool get_gps_location(std::string *response, uint32_t timeout_ms = 5000);
 static bool is_valid_coordinate(double latitude, double longitude);
 static double hdop_to_estimated_meters(double hdop);
@@ -875,7 +874,6 @@ bool enable_gps(void)
         return false;
     }
     ESP_LOGI(TAG, "GPS power on: SUCCESS");
-<<<<<<< HEAD
     // Request richer GNSS outputs (GGA/GSA/GSV/RMC) so HDOP and satellite info
     // are available when the modem supports them. Failure is non-fatal.
     if (!send_at_command("AT+CGNSSEQ=\"GGA\",\"GSA\",\"GSV\",\"RMC\"\r", &response, 3000)) {
@@ -883,42 +881,11 @@ bool enable_gps(void)
     } else {
         ESP_LOGI(TAG, "GPS sequence configured for richer metadata");
     }
-=======
-    if (!send_at_command("AT+CGNSSEQ=\"RMC\"\r", &response, 3000)) {
-        ESP_LOGW(TAG, "GPS RMC configuration: FAILED -> %s", trim_response(response).c_str());
-        s_state.gps_enabled = false;
-        return false;
-    }
-    ESP_LOGI(TAG, "GPS RMC configuration: SUCCESS");
-    s_state.gps_enabled = true;
-    return true;
-}
-
-bool disable_gps(void)
-{
-    if (!s_state.gps_enabled) {
-        return true;
-    }
-
-    std::string response;
-    if (!send_at_command("AT+CGNSPWR=0\r", &response, 3000)) {
-        ESP_LOGW(TAG, "GPS power off: FAILED -> %s", trim_response(response).c_str());
-        return false;
-    }
-    s_state.gps_enabled = false;
-    ESP_LOGI(TAG, "GPS power off: SUCCESS");
->>>>>>> 52cdcfe (Add GNSS power-save, PM locks, event-driven comms, and GPS robustness)
     return true;
 }
 
 bool get_gps_location(std::string *response, uint32_t timeout_ms)
 {
-    if (!s_state.gps_enabled && !enable_gps()) {
-        if (response != nullptr) {
-            response->clear();
-        }
-        return false;
-    }
     std::string gps_response;
     const bool ok = send_at_command("AT+CGNSINF\r", &gps_response, timeout_ms);
     if (response != nullptr) {
@@ -1226,12 +1193,7 @@ extern "C" bool gl868_modem_init(void)
         ESP_LOGI(TAG, "Initial readiness URCs disabled (Call Ready/SMS Ready)");
     }
 
- #if defined(CONFIG_SAFETY_BAND_GNSS_POWER_SAVE) && CONFIG_SAFETY_BAND_GNSS_POWER_SAVE
-    s_state.gps_enabled = false;
-    ESP_LOGI(TAG, "GNSS power-save enabled; GPS will start on demand");
- #else
     s_state.gps_enabled = enable_gps();
- #endif
     s_state.initialized = true;
     ESP_LOGI(TAG, "SIM868 modem bridge initialized (GPS=%d)", s_state.gps_enabled);
 
@@ -1496,19 +1458,10 @@ extern "C" bool gl868_modem_get_gps_coordinates(double *latitude, double *longit
     return true;
 }
 
-<<<<<<< HEAD
 extern "C" void gl868_modem_set_movement_profile(int profile)
 {
     set_kalman_profile(profile);
     ESP_LOGI(TAG, "Movement profile set: %d", profile);
-=======
-extern "C" bool gl868_modem_set_gnss_power(bool enabled)
-{
-    if (!s_state.initialized) {
-        return false;
-    }
-    return enabled ? enable_gps() : disable_gps();
->>>>>>> 52cdcfe (Add GNSS power-save, PM locks, event-driven comms, and GPS robustness)
 }
 
 extern "C" const char *gl868_modem_get_emergency_call_number(void)
