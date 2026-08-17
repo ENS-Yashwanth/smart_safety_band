@@ -875,6 +875,7 @@ bool enable_gps(void)
         return false;
     }
     ESP_LOGI(TAG, "GPS power on: SUCCESS");
+<<<<<<< HEAD
     // Request richer GNSS outputs (GGA/GSA/GSV/RMC) so HDOP and satellite info
     // are available when the modem supports them. Failure is non-fatal.
     if (!send_at_command("AT+CGNSSEQ=\"GGA\",\"GSA\",\"GSV\",\"RMC\"\r", &response, 3000)) {
@@ -882,7 +883,7 @@ bool enable_gps(void)
     } else {
         ESP_LOGI(TAG, "GPS sequence configured for richer metadata");
     }
-
+=======
     if (!send_at_command("AT+CGNSSEQ=\"RMC\"\r", &response, 3000)) {
         ESP_LOGW(TAG, "GPS RMC configuration: FAILED -> %s", trim_response(response).c_str());
         s_state.gps_enabled = false;
@@ -906,6 +907,7 @@ bool disable_gps(void)
     }
     s_state.gps_enabled = false;
     ESP_LOGI(TAG, "GPS power off: SUCCESS");
+>>>>>>> 52cdcfe (Add GNSS power-save, PM locks, event-driven comms, and GPS robustness)
     return true;
 }
 
@@ -1494,18 +1496,19 @@ extern "C" bool gl868_modem_get_gps_coordinates(double *latitude, double *longit
     return true;
 }
 
+<<<<<<< HEAD
 extern "C" void gl868_modem_set_movement_profile(int profile)
 {
     set_kalman_profile(profile);
     ESP_LOGI(TAG, "Movement profile set: %d", profile);
-}
-
+=======
 extern "C" bool gl868_modem_set_gnss_power(bool enabled)
 {
     if (!s_state.initialized) {
         return false;
     }
     return enabled ? enable_gps() : disable_gps();
+>>>>>>> 52cdcfe (Add GNSS power-save, PM locks, event-driven comms, and GPS robustness)
 }
 
 extern "C" const char *gl868_modem_get_emergency_call_number(void)
