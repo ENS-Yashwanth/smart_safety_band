@@ -38,7 +38,7 @@
 #define MOTION_INT_GPIO ((gpio_num_t)CONFIG_SAFETY_BAND_MOTION_INT_GPIO)
 #define I2C_TIMEOUT_MS 100
 #define COMMUNICATION_QUEUE_DEPTH 8
-#define GPS_UPDATE_INTERVAL_MS (2 * 60 * 1000)
+#define GPS_UPDATE_INTERVAL_MS (3 * 60 * 1000)
 #define SOS_DEBOUNCE_MS 60
 
 #define BIT_MODEM_READY BIT0
@@ -46,7 +46,7 @@
 
 static const char *TAG = "SMART_SAFETY_BAND_001";
 
-typedef enum { COMM_EVENT_EMERGENCY, COMM_EVENT_GPS_UPLOAD } communication_event_type_t;
+typedef enum { COMM_EVENT_EMERGENCY, COMM_EVENT_GPS_UPLOAD, COMM_EVENT_LIVE_TRACKING } communication_event_type_t;
 typedef struct { communication_event_type_t type; const char *source; } communication_event_t;
 
 static SemaphoreHandle_t s_i2c_mutex;
@@ -130,16 +130,21 @@ static void communication_task(void *argument)
             }
             const int battery = gl868_modem_get_battery_percent();
             ESP_LOGI(TAG, "GPS sample: %.6f,%.6f (battery=%d%%)", latitude, longitude, battery);
+        } else if (event.type == COMM_EVENT_LIVE_TRACKING) {
+            ESP_LOGI(TAG, "Sending scheduled live location");
+            if (!gl868_modem_send_live_location()) {
+                ESP_LOGW(TAG, "Scheduled live location was not sent");
+            }
         }
     }
 }
 
-/* Schedules two-minute live-location uploads without competing for modem UART. */
-static __attribute__((unused)) void gps_task(void *argument)
+/* Schedules three-minute live-location SMS updates without competing for modem UART. */
+static void gps_task(void *argument)
 {
     xEventGroupWaitBits(s_system_events, BIT_MODEM_READY, pdFALSE, pdTRUE, portMAX_DELAY);
     for (;;) {
-        queue_communication_event(COMM_EVENT_GPS_UPLOAD, "two-minute GPS update");
+        queue_communication_event(COMM_EVENT_LIVE_TRACKING, "three-minute live tracking update");
         vTaskDelay(pdMS_TO_TICKS(GPS_UPDATE_INTERVAL_MS));
     }
 }
@@ -176,6 +181,6 @@ void app_main(void)
     ESP_LOGI(TAG, "Communication task started for modem UART access");
     xTaskCreate(sos_button_task, "sos_button", 2048, NULL, 8, NULL);
     ESP_LOGI(TAG, "SOS button task started on GPIO %d", SOS_BUTTON_GPIO);
-    xTaskCreate(gps_task, "gps_upload", 2048, NULL, 4, NULL);
-    ESP_LOGI(TAG, "GPS task started for location updates");
+    xTaskCreate(gps_task, "gps_upload", 3072, NULL, 4, NULL);
+    ESP_LOGI(TAG, "GPS live-tracking task started; updates every 3 minutes");
 }

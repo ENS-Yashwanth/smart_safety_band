@@ -13,6 +13,8 @@ void gl868_modem_run_full_diagnostics(void);
 bool gl868_modem_send_test_sms(const char *message);
 bool gl868_modem_send_sms_to(const char *number, const char *message);
 bool gl868_modem_make_call_to(const char *number);
+bool gl868_modem_hang_up_call(void);
+bool gl868_modem_send_live_location(void);
 bool gl868_modem_get_gps_now(char *buf, size_t buf_len);
 bool gl868_modem_get_gps_coordinates(double *latitude, double *longitude);
 const char *gl868_modem_get_emergency_call_number(void);

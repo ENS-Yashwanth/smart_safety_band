@@ -24,6 +24,14 @@ menu "Smart Safety Band configuration"
             available. The real accelerometer is always preferred; only absent
             health/environment modules produce clearly labelled simulated data.
 
+    config SAFETY_BAND_GNSS_POWER_SAVE
+        bool "Enable GNSS power saving after init and SOS"
+        default y
+        help
+            Powers off the GNSS modem after the initial fix and again after
+            emergency handling to reduce power consumption. It wakes back up on
+            demand when a fresh GPS fix is needed.
+
     config SAFETY_BAND_EMERGENCY_CALL_NUMBER
         string "Emergency call number"
         default "+916309538622"

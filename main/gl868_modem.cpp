@@ -690,34 +690,52 @@ static void log_call_preflight(void)
     }
 }
 
-static bool clcc_has_active_call(const std::string &response)
+static bool clcc_has_connected_call(const std::string &response)
 {
     size_t pos = 0;
     while ((pos = response.find("+CLCC:", pos)) != std::string::npos) {
         const size_t line_end = response.find('\n', pos);
-        std::string line = response.substr(pos, line_end == std::string::npos ? std::string::npos : line_end - pos);
+        const std::string line = response.substr(pos, line_end == std::string::npos ? std::string::npos : line_end - pos);
         pos = line_end == std::string::npos ? std::string::npos : line_end + 1;
+
         const size_t colon = line.find(':');
         if (colon == std::string::npos) continue;
         std::string rest = line.substr(colon + 1);
-        std::vector<std::string> fields;
-        size_t start = 0;
-        while (start < rest.size()) {
-            size_t comma = rest.find(',', start);
-            if (comma == std::string::npos) {
-                fields.push_back(trim_response(rest.substr(start)));
-                break;
+        size_t field_start = 0;
+        int field_index = 0;
+        while (field_start < rest.size()) {
+            const size_t comma = rest.find(',', field_start);
+            const std::string field = trim_response(rest.substr(field_start, comma == std::string::npos ? std::string::npos : comma - field_start));
+            if (field_index == 2) {
+                return atoi(field.c_str()) == 0;
             }
-            fields.push_back(trim_response(rest.substr(start, comma - start)));
-            start = comma + 1;
-        }
-        if (fields.size() < 3) continue;
-        int stat = atoi(fields[2].c_str());
-        if (stat == 0 || stat == 1 || stat == 2 || stat == 3 || stat == 5) {
-            return true;
+            ++field_index;
+            if (comma == std::string::npos) break;
+            field_start = comma + 1;
         }
     }
     return false;
+}
+
+static bool configure_audio_path(void)
+{
+    const char *commands[] = {
+        "AT+CHFA=1\r",
+        "AT+CLVL=90\r",
+        "AT+CMIC=0,12\r",
+        "AT+FMMUTE=0\r",
+        "AT+SIDET=1\r",
+    };
+
+    bool configured = true;
+    for (const char *command : commands) {
+        std::string response;
+        if (!send_at_command(command, &response, 3000)) {
+            ESP_LOGW(TAG, "Audio command failed (%s): %s", trim_response(command).c_str(), trim_response(response).c_str());
+            configured = false;
+        }
+    }
+    return configured;
 }
 
 static void log_call_failure_details(void)
@@ -812,6 +830,10 @@ bool send_sms(const std::string &number, const std::string &message)
 bool make_call(const std::string &number)
 {
     std::string response;
+    if (!configure_audio_path()) {
+        ESP_LOGW(TAG, "Audio path setup before dialing was not fully acknowledged");
+    }
+
     std::string cmd = "ATD" + number + ";\r";
     ESP_LOGI(TAG, "Issuing emergency call command: %s", cmd.c_str());
     const bool ok = send_at_command(cmd, &response, 15000);
@@ -832,31 +854,25 @@ bool make_call(const std::string &number)
         ESP_LOGI(TAG, "Emergency call command completed without explicit OK; verifying call state");
     }
 
-    vTaskDelay(pdMS_TO_TICKS(2000));
-    std::string clcc_response;
-    bool had_active_call = false;
-    if (send_at_command("AT+CLCC?\r", &clcc_response, 5000)) {
-        ESP_LOGI(TAG, "Post-dial call list: %s", trim_response(clcc_response).c_str());
-        if (clcc_has_active_call(clcc_response)) {
-            ESP_LOGI(TAG, "Ongoing call confirmed by AT+CLCC?");
-            had_active_call = true;
+    const TickType_t deadline = xTaskGetTickCount() + pdMS_TO_TICKS(30000);
+    while (xTaskGetTickCount() < deadline) {
+        vTaskDelay(pdMS_TO_TICKS(1000));
+        std::string clcc_response;
+        if (send_at_command("AT+CLCC?\r", &clcc_response, 5000)) {
+            ESP_LOGI(TAG, "Post-dial call list: %s", trim_response(clcc_response).c_str());
+            if (clcc_has_connected_call(clcc_response)) {
+                ESP_LOGI(TAG, "Call answered; configuring external speaker and microphone audio");
+                if (!configure_audio_path()) {
+                    ESP_LOGW(TAG, "Audio path setup after call connection was not fully acknowledged");
+                }
+                return true;
+            }
         }
-    } else {
-        ESP_LOGI(TAG, "Post-dial call list query failed: %s", trim_response(clcc_response).c_str());
-    }
-
-    if (had_active_call) {
-        return true;
     }
 
     std::string pas_response;
     if (send_at_command("AT+CPAS\r", &pas_response, 5000, "+CPAS:")) {
-        ESP_LOGI(TAG, "Phone activity after dial: %s", trim_response(pas_response).c_str());
-        const std::string pas_trimmed = trim_response(pas_response);
-        if (pas_trimmed.find("+CPAS: 3") != std::string::npos || pas_trimmed.find("+CPAS: 4") != std::string::npos) {
-            ESP_LOGI(TAG, "Call activity detected after dial");
-            return true;
-        }
+        ESP_LOGI(TAG, "Phone activity after dial timeout: %s", trim_response(pas_response).c_str());
     }
 
     if (trimmed.find("NO CARRIER") != std::string::npos) {
@@ -1312,6 +1328,34 @@ extern "C" bool gl868_modem_make_call_to(const char *number)
 {
     if (!s_state.initialized || number == nullptr) return false;
     return make_call(std::string(number));
+}
+
+extern "C" bool gl868_modem_hang_up_call(void)
+{
+    if (!s_state.initialized) return false;
+    std::string response;
+    const bool ok = send_at_command("ATH\r", &response, 5000);
+    ESP_LOGI(TAG, "Call hang-up: %s (%s)", ok ? "success" : "failed", trim_response(response).c_str());
+    return ok;
+}
+
+extern "C" bool gl868_modem_send_live_location(void)
+{
+    if (!s_state.initialized) return false;
+
+    double latitude = 0.0;
+    double longitude = 0.0;
+    if (!gl868_modem_get_gps_coordinates(&latitude, &longitude)) {
+        ESP_LOGW(TAG, "Live tracking: no valid GPS fix; SMS not sent");
+        return false;
+    }
+
+    char message[96];
+    snprintf(message, sizeof(message), "https://maps.google.com/?q=%.6f,%.6f", latitude, longitude);
+    const char *number = get_emergency_sms_number();
+    const bool sent = send_sms(number, std::string(message));
+    ESP_LOGI(TAG, "Live tracking SMS to %s -> %s: %s", number, sent ? "sent" : "failed", message);
+    return sent;
 }
 
 extern "C" bool gl868_modem_get_gps_now(char *buf, size_t buf_len)
