@@ -719,12 +719,19 @@ static bool clcc_has_connected_call(const std::string &response)
 
 static bool configure_audio_path(void)
 {
+    /*
+     * The GeoLinker board exposes its external speaker/microphone on the
+     * SIM868 AUX audio path.  Keep every per-channel setting on that same
+     * path.  +FMMUTE is an FM-radio command and is not implemented by this
+     * firmware.  This firmware also rejects +CMUT while the modem is idle;
+     * it is not required because call audio starts unmuted.  +SIDET always
+     * needs both the audio channel and the side-tone gain.
+     */
     const char *commands[] = {
         "AT+CHFA=1\r",
         "AT+CLVL=90\r",
-        "AT+CMIC=0,12\r",
-        "AT+FMMUTE=0\r",
-        "AT+SIDET=1\r",
+        "AT+CMIC=1,12\r",
+        "AT+SIDET=1,1\r",
     };
 
     bool configured = true;
