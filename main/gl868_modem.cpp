@@ -1088,11 +1088,6 @@ extern "C" void gl868_modem_run_full_diagnostics(void)
     run_command("AT+COPS?", "Operator");
     run_command("AT+CSQ", "RSSI");
     run_command("AT+CREG?", "Registration");
-
-    ESP_LOGI(TAG, "-----------");
-    ESP_LOGI(TAG, "Battery");
-    ESP_LOGI(TAG, "-----------");
-    run_command("AT+CBC", "Battery / Power Status");
 }
 
 extern "C" bool gl868_modem_send_test_sms(const char *message)
