@@ -24,13 +24,31 @@ menu "Smart Safety Band configuration"
             available. The real accelerometer is always preferred; only absent
             health/environment modules produce clearly labelled simulated data.
 
+    config SAFETY_BAND_POWER_MANAGEMENT
+        bool "Enable automatic light sleep and dynamic frequency scaling"
+        default y
+        depends on PM_ENABLE
+        help
+            Uses ESP-IDF automatic light sleep while application tasks are
+            idle. The firmware holds PM locks during modem UART, GPS, SMS and
+            call operations so those operations are not interrupted.
+
+    config SAFETY_BAND_PM_MIN_FREQ_MHZ
+        int "Minimum CPU frequency (MHz)"
+        range 10 160
+        default 40
+        depends on SAFETY_BAND_POWER_MANAGEMENT
+        help
+            Lowest CPU frequency used while the system is active but does not
+            require full performance. 40 MHz is the recommended balance for
+            modem responsiveness and battery life.
+
     config SAFETY_BAND_GNSS_POWER_SAVE
-        bool "Enable GNSS power saving after init and SOS"
+        bool "Power down GNSS between location operations"
         default y
         help
-            Powers off the GNSS modem after the initial fix and again after
-            emergency handling to reduce power consumption. It wakes back up on
-            demand when a fresh GPS fix is needed.
+            Powers down GNSS after each location or emergency operation. GNSS
+            automatically powers on again before the next location request.
 
     config SAFETY_BAND_EMERGENCY_CALL_NUMBER
         string "Emergency call number"
@@ -50,6 +68,14 @@ menu "Smart Safety Band configuration"
         default "iot.com"
         help
             APN supplied by the SIM provider. The GeoLinker reference SIM uses iot.com.
+
+    config SAFETY_BAND_DASHBOARD_HTTP_URL
+        string "Dashboard HTTP POST URL"
+        default "http://httpbin.org/post"
+        help
+            HTTP endpoint that receives periodic JSON telemetry. The default is
+            a public test endpoint; replace it with the production dashboard
+            URL before deployment. HTTPS is not enabled by this setting.
 
     config SAFETY_BAND_GEOLINKER_API_KEY
         string "GeoLinker API key"

@@ -8,6 +8,8 @@
 #include "driver/uart.h"
 #include "esp_err.h"
 #include "esp_log.h"
+#include "esp_pm.h"
+#include "esp_sleep.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/event_groups.h"
 #include "freertos/queue.h"
@@ -23,6 +25,15 @@
 #endif
 #ifndef CONFIG_SAFETY_BAND_SIMULATION
 #define CONFIG_SAFETY_BAND_SIMULATION 0
+#endif
+#ifndef CONFIG_SAFETY_BAND_POWER_MANAGEMENT
+#define CONFIG_SAFETY_BAND_POWER_MANAGEMENT 1
+#endif
+#ifndef CONFIG_SAFETY_BAND_PM_MIN_FREQ_MHZ
+#define CONFIG_SAFETY_BAND_PM_MIN_FREQ_MHZ 40
+#endif
+#ifndef CONFIG_SAFETY_BAND_GNSS_POWER_SAVE
+#define CONFIG_SAFETY_BAND_GNSS_POWER_SAVE 1
 #endif
 
 /* GL868 reference pins. SOS and motion interrupt are menuconfig options. */
@@ -53,9 +64,59 @@ static SemaphoreHandle_t s_i2c_mutex;
 static SemaphoreHandle_t s_sos_sem;
 static QueueHandle_t s_communication_events;
 static EventGroupHandle_t s_system_events;
+#if CONFIG_PM_ENABLE && CONFIG_SAFETY_BAND_POWER_MANAGEMENT
+static esp_pm_lock_handle_t s_modem_no_light_sleep_lock;
+static esp_pm_lock_handle_t s_modem_apb_lock;
+#endif
 static const int s_sos_button_idle_level = 1;
 static const int s_sos_button_active_level = 0;
-static int s_sos_button_last_level = 1;
+
+/* Automatic light sleep is allowed while all tasks are idle. Modem operations
+ * hold both locks so UART timing and active calls are never interrupted. */
+static void modem_power_lock_acquire(void)
+{
+#if CONFIG_PM_ENABLE && CONFIG_SAFETY_BAND_POWER_MANAGEMENT
+    ESP_ERROR_CHECK(esp_pm_lock_acquire(s_modem_no_light_sleep_lock));
+    ESP_ERROR_CHECK(esp_pm_lock_acquire(s_modem_apb_lock));
+#endif
+}
+
+static void modem_power_lock_release(void)
+{
+#if CONFIG_PM_ENABLE && CONFIG_SAFETY_BAND_POWER_MANAGEMENT
+    ESP_ERROR_CHECK(esp_pm_lock_release(s_modem_apb_lock));
+    ESP_ERROR_CHECK(esp_pm_lock_release(s_modem_no_light_sleep_lock));
+#endif
+}
+
+static void init_power_management(void)
+{
+#if CONFIG_PM_ENABLE && CONFIG_SAFETY_BAND_POWER_MANAGEMENT
+    const esp_pm_config_t pm_config = {
+        .max_freq_mhz = CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ,
+        .min_freq_mhz = CONFIG_SAFETY_BAND_PM_MIN_FREQ_MHZ,
+        .light_sleep_enable = true,
+    };
+    ESP_ERROR_CHECK(esp_pm_configure(&pm_config));
+    ESP_ERROR_CHECK(esp_pm_lock_create(ESP_PM_NO_LIGHT_SLEEP, 0, "sim868", &s_modem_no_light_sleep_lock));
+    ESP_ERROR_CHECK(esp_pm_lock_create(ESP_PM_APB_FREQ_MAX, 0, "sim868_uart", &s_modem_apb_lock));
+    ESP_ERROR_CHECK(gpio_wakeup_enable(SOS_BUTTON_GPIO, GPIO_INTR_LOW_LEVEL));
+    ESP_ERROR_CHECK(esp_sleep_enable_gpio_wakeup());
+    ESP_LOGI(TAG, "PM enabled: %d-%d MHz with automatic light sleep",
+             CONFIG_SAFETY_BAND_PM_MIN_FREQ_MHZ, CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ);
+#else
+    ESP_LOGW(TAG, "PM disabled; enable CONFIG_PM_ENABLE and tickless idle");
+#endif
+}
+
+static void enter_gnss_idle_power_save(void)
+{
+#if CONFIG_SAFETY_BAND_GNSS_POWER_SAVE
+    if (!gl868_modem_set_gnss_power(false)) {
+        ESP_LOGW(TAG, "Could not enter GNSS power-save mode");
+    }
+#endif
+}
 
 static void queue_communication_event(communication_event_type_t type, const char *source)
 {
@@ -83,10 +144,9 @@ static void init_io(void)
     ESP_ERROR_CHECK(gpio_config(&output));
     gpio_set_level(STATUS_LED_GPIO, 0); gpio_set_level(MODEM_POWER_GPIO, 1);
     gpio_config_t input = {.pin_bit_mask = (1ULL << SOS_BUTTON_GPIO), .mode = GPIO_MODE_INPUT,
-                           .pull_up_en = GPIO_PULLUP_ENABLE, .intr_type = GPIO_INTR_ANYEDGE};
+                           .pull_up_en = GPIO_PULLUP_ENABLE, .intr_type = GPIO_INTR_NEGEDGE};
     ESP_ERROR_CHECK(gpio_config(&input));
     int initial_level = gpio_get_level(SOS_BUTTON_GPIO);
-    s_sos_button_last_level = initial_level;
     if (initial_level != s_sos_button_idle_level) {
         ESP_LOGW(TAG, "SOS GPIO %d booted in active state or is held low; check wiring and button contact", SOS_BUTTON_GPIO);
     }
@@ -104,7 +164,9 @@ static void communication_task(void *argument)
     for (;;) {
         if (!modem_ready) {
             ESP_LOGI(TAG, "Powering and initializing SIM868 modem");
+            modem_power_lock_acquire();
             modem_ready = gl868_modem_init();
+            modem_power_lock_release();
             if (modem_ready) {
                 xEventGroupSetBits(s_system_events, BIT_MODEM_READY);
                 ESP_LOGI(TAG, "SIM868 ready for emergency and GPS services");
@@ -120,21 +182,31 @@ static void communication_task(void *argument)
         if (xQueueReceive(s_communication_events, &event, portMAX_DELAY) != pdTRUE) continue;
         if (event.type == COMM_EVENT_EMERGENCY) {
             ESP_LOGW(TAG, "SOS emergency received from %s", event.source);
+            modem_power_lock_acquire();
             gl868_modem_trigger_emergency(event.source, 0);
+            enter_gnss_idle_power_save();
+            modem_power_lock_release();
         } else if (event.type == COMM_EVENT_GPS_UPLOAD) {
             double latitude = 0.0;
             double longitude = 0.0;
+            modem_power_lock_acquire();
             if (!gl868_modem_get_gps_coordinates(&latitude, &longitude)) {
                 ESP_LOGW(TAG, "No valid GPS fix");
                 continue;
+            } else {
+                const int battery = gl868_modem_get_battery_percent();
+                ESP_LOGI(TAG, "GPS sample: %.6f,%.6f (battery=%d%%)", latitude, longitude, battery);
             }
-            const int battery = gl868_modem_get_battery_percent();
-            ESP_LOGI(TAG, "GPS sample: %.6f,%.6f (battery=%d%%)", latitude, longitude, battery);
+            enter_gnss_idle_power_save();
+            modem_power_lock_release();
         } else if (event.type == COMM_EVENT_LIVE_TRACKING) {
-            ESP_LOGI(TAG, "Sending scheduled live location");
-            if (!gl868_modem_send_live_location()) {
-                ESP_LOGW(TAG, "Scheduled live location was not sent");
+            ESP_LOGI(TAG, "Sending scheduled dashboard telemetry");
+            modem_power_lock_acquire();
+            if (!gl868_modem_send_dashboard_packet()) {
+                ESP_LOGW(TAG, "Scheduled dashboard telemetry was not sent");
             }
+            enter_gnss_idle_power_save();
+            modem_power_lock_release();
         }
     }
 }
@@ -149,7 +221,7 @@ static void gps_task(void *argument)
     }
 }
 
-static __attribute__((unused)) void sos_button_task(void *argument)
+static void sos_button_task(void *argument)
 {
     int last_level = gpio_get_level(SOS_BUTTON_GPIO);
     for (;;) {
@@ -177,6 +249,7 @@ void app_main(void)
     s_system_events = xEventGroupCreate();
     configASSERT(s_i2c_mutex && s_sos_sem && s_communication_events && s_system_events);
     init_io();
+    init_power_management();
     xTaskCreate(communication_task, "communication", 6144, NULL, 10, NULL);
     ESP_LOGI(TAG, "Communication task started for modem UART access");
     xTaskCreate(sos_button_task, "sos_button", 2048, NULL, 8, NULL);

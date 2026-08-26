@@ -399,6 +399,8 @@ struct GpsFixInfo {
     int fix_mode = -1;
     double latitude = 0.0;
     double longitude = 0.0;
+    double speed_kmh = -1.0;
+    double heading_degrees = -1.0;
     double hdop = -1.0;
     int satellites_in_view = -1;
     int satellites_used = -1;
@@ -443,6 +445,14 @@ static bool parse_gps_fix_info_from_cgnsinf(const std::string &cgnsinf, GpsFixIn
     if (endptr == fields[4].c_str()) return false;
     if (!is_valid_coordinate(info.latitude, info.longitude)) {
         return false;
+    }
+    if (fields.size() > 6) {
+        info.speed_kmh = strtod(fields[6].c_str(), &endptr);
+        if (endptr == fields[6].c_str()) info.speed_kmh = -1.0;
+    }
+    if (fields.size() > 7) {
+        info.heading_degrees = strtod(fields[7].c_str(), &endptr);
+        if (endptr == fields[7].c_str()) info.heading_degrees = -1.0;
     }
 
     if (fields.size() > 8) {
@@ -909,6 +919,17 @@ bool enable_gps(void)
 
 bool get_gps_location(std::string *response, uint32_t timeout_ms)
 {
+    if (!s_state.gps_enabled) {
+        ESP_LOGI(TAG, "GPS is in power-save mode; enabling it for a location request");
+        if (!enable_gps()) {
+            if (response != nullptr) {
+                response->clear();
+            }
+            return false;
+        }
+        s_state.gps_enabled = true;
+    }
+
     std::string gps_response;
     const bool ok = send_at_command("AT+CGNSINF\r", &gps_response, timeout_ms);
     if (response != nullptr) {
@@ -1332,6 +1353,29 @@ extern "C" bool gl868_modem_make_call_to(const char *number)
     return make_call(std::string(number));
 }
 
+extern "C" bool gl868_modem_set_gnss_power(bool enabled)
+{
+    if (!s_state.initialized) return false;
+
+    if (enabled) {
+        if (s_state.gps_enabled) return true;
+        const bool ok = enable_gps();
+        if (ok) s_state.gps_enabled = true;
+        return ok;
+    }
+
+    if (!s_state.gps_enabled) return true;
+    std::string response;
+    const bool ok = send_at_command("AT+CGNSPWR=0\r", &response, 3000);
+    if (ok) {
+        s_state.gps_enabled = false;
+        ESP_LOGI(TAG, "GPS power off: SUCCESS");
+    } else {
+        ESP_LOGW(TAG, "GPS power off: FAILED -> %s", trim_response(response).c_str());
+    }
+    return ok;
+}
+
 extern "C" bool gl868_modem_hang_up_call(void)
 {
     if (!s_state.initialized) return false;
@@ -1339,6 +1383,99 @@ extern "C" bool gl868_modem_hang_up_call(void)
     const bool ok = send_at_command("ATH\r", &response, 5000);
     ESP_LOGI(TAG, "Call hang-up: %s (%s)", ok ? "success" : "failed", trim_response(response).c_str());
     return ok;
+}
+
+extern "C" bool gl868_modem_send_dashboard_packet(void)
+{
+    if (!s_state.initialized) return false;
+
+#ifdef CONFIG_SAFETY_BAND_DASHBOARD_HTTP_URL
+    const char *url = CONFIG_SAFETY_BAND_DASHBOARD_HTTP_URL;
+#else
+    const char *url = "";
+#endif
+    if (url == nullptr || url[0] == '\0') {
+        ESP_LOGW(TAG, "Dashboard HTTP URL is empty; set SAFETY_BAND_DASHBOARD_HTTP_URL");
+        return false;
+    }
+
+    std::string gps_response;
+    GpsFixInfo fix;
+    if (!get_gps_location(&gps_response, 10000) ||
+        !parse_gps_fix_info_from_cgnsinf(gps_response, fix) || !fix.valid) {
+        ESP_LOGW(TAG, "Dashboard packet not sent: no valid GPS fix");
+        return false;
+    }
+
+    const int battery = gl868_modem_get_battery_percent();
+    const char *device_id =
+#ifdef CONFIG_SAFETY_BAND_GEOLINKER_DEVICE_ID
+        CONFIG_SAFETY_BAND_GEOLINKER_DEVICE_ID;
+#else
+        "smart_safety_band";
+#endif
+    char json[512];
+    const int written = snprintf(
+        json, sizeof(json),
+        "{\"id\":\"%s\",\"timestamp\":\"%s\",\"lat\":%.6f,\"long\":%.6f,"
+        "\"speed\":%.2f,\"heading\":%.2f,\"accuracy\":%.2f,\"satellites\":%d,"
+        "\"battery\":%d,\"payload\":{\"temperature\":null,\"humidity\":null}}",
+        device_id, fix.timestamp.c_str(), fix.latitude, fix.longitude,
+        fix.speed_kmh, fix.heading_degrees, fix.hdop, fix.satellites_used,
+        battery);
+    if (written < 0 || static_cast<size_t>(written) >= sizeof(json)) {
+        ESP_LOGE(TAG, "Dashboard JSON packet is too large");
+        return false;
+    }
+
+    std::string response;
+    const char *apn =
+#ifdef CONFIG_SAFETY_BAND_GPRS_APN
+        CONFIG_SAFETY_BAND_GPRS_APN;
+#else
+        "";
+#endif
+    const bool bearer_ok =
+        send_at_command("AT+SAPBR=3,1,\"CONTYPE\",\"GPRS\"\r", &response, 5000) &&
+        send_at_command(std::string("AT+SAPBR=3,1,\"APN\",\"") + apn + "\"\r", &response, 5000) &&
+        send_at_command("AT+SAPBR=1,1\r", &response, 30000);
+    if (!bearer_ok) {
+        ESP_LOGW(TAG, "Dashboard PDP bearer setup failed: %s", trim_response(response).c_str());
+        return false;
+    }
+
+    bool http_initialized = false;
+    bool sent = false;
+    if (!send_at_command("AT+HTTPINIT\r", &response, 5000)) {
+        ESP_LOGW(TAG, "HTTPINIT failed: %s", trim_response(response).c_str());
+    } else {
+        http_initialized = true;
+        const bool configured =
+            send_at_command("AT+HTTPPARA=\"CID\",1\r", &response, 5000) &&
+            send_at_command(std::string("AT+HTTPPARA=\"URL\",\"") + url + "\"\r", &response, 10000) &&
+            send_at_command("AT+HTTPPARA=\"CONTENT\",\"application/json\"\r", &response, 5000);
+        if (!configured) {
+            ESP_LOGW(TAG, "HTTP parameter setup failed: %s", trim_response(response).c_str());
+        } else {
+            const std::string data_command = "AT+HTTPDATA=" + std::to_string(written) + ",10000\r";
+            if (!wait_for_prompt(data_command, "DOWNLOAD", &response, 10000)) {
+                ESP_LOGW(TAG, "HTTPDATA prompt failed: %s", trim_response(response).c_str());
+            } else if (!send_at_command(std::string(json), &response, 15000)) {
+                ESP_LOGW(TAG, "HTTP JSON upload failed: %s", trim_response(response).c_str());
+            } else if (!send_at_command("AT+HTTPACTION=1\r", &response, 60000, "+HTTPACTION:")) {
+                ESP_LOGW(TAG, "HTTP POST action failed: %s", trim_response(response).c_str());
+            } else {
+                sent = response.find("+HTTPACTION: 1,2") != std::string::npos;
+                ESP_LOGI(TAG, "Dashboard HTTP result: %s", trim_response(response).c_str());
+            }
+        }
+    }
+
+    if (http_initialized) {
+        send_at_command("AT+HTTPTERM\r", &response, 5000);
+    }
+    send_at_command("AT+SAPBR=0,1\r", &response, 10000);
+    return sent;
 }
 
 extern "C" bool gl868_modem_send_live_location(void)
