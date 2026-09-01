@@ -15,15 +15,15 @@ bool gl868_modem_send_sms_to(const char *number, const char *message);
 bool gl868_modem_make_call_to(const char *number);
 bool gl868_modem_hang_up_call(void);
 bool gl868_modem_send_live_location(void);
-bool gl868_modem_send_dashboard_packet(const char *json_payload);
 bool gl868_modem_get_gps_now(char *buf, size_t buf_len);
 bool gl868_modem_get_gps_coordinates(double *latitude, double *longitude);
+bool gl868_modem_set_gnss_power(bool enabled);
+bool gl868_modem_send_dashboard_packet(void);
 const char *gl868_modem_get_emergency_call_number(void);
 const char *gl868_modem_get_emergency_sms_number(void);
 int gl868_modem_get_battery_percent(void);
 void gl868_modem_request_deferred_gps_upload(void);
 void gl868_modem_set_movement_profile(int profile);
-bool gl868_modem_set_gnss_power(bool enabled);
 
 #define GL868_PROFILE_STATIONARY 0
 #define GL868_PROFILE_WALKING 1
