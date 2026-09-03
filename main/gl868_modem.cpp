@@ -122,13 +122,16 @@ static std::string smart_band_correlation_id(const std::string &band_id,
                                              const char *event_type) {
   if (event_type != nullptr && std::strcmp(event_type, "sos") == 0) {
     if (s_current_sos_correlation_id.empty()) {
-      s_current_sos_correlation_id = "sos-" + utc_rfc3339_now();
+      /* Correlation id format: <band_id>-sos-<timestamp>
+       * This makes it easy to associate events from the same SOS episode
+       * with the originating device. */
+      s_current_sos_correlation_id = band_id + "-sos-" + utc_rfc3339_now();
     }
     return s_current_sos_correlation_id;
   }
   if (event_type != nullptr && std::strcmp(event_type, "sos.updated") == 0) {
     if (s_current_sos_correlation_id.empty()) {
-      s_current_sos_correlation_id = "sos-" + utc_rfc3339_now();
+      s_current_sos_correlation_id = band_id + "-sos-" + utc_rfc3339_now();
     }
     return s_current_sos_correlation_id;
   }
@@ -880,9 +883,7 @@ static std::string build_smart_band_event_json(const char *event_type,
     evidence = "[]";
   } else if (normalized_event_type == "sos.triggered") {
     payload = "{\"band_id\":\"" + json_escape(band_id) +
-              "\","
-              "\"trigger\":\"button\",\"sos_status\":\"triggered\","
-              "\"location_source\":\"gps\",\"altitude_m\":null}";
+              "\",\"trigger\":\"button\",\"sos_status\":\"triggered\"}";
     evidence = "[]";
   } else {
     payload = "{\"band_id\":\"" + json_escape(band_id) +
@@ -2365,8 +2366,13 @@ extern "C" void gl868_modem_trigger_emergency(const char *source,
         batt >= 0 ? batt : 0);
   }
 
+<<<<<<< Updated upstream
   /* STEP 1: Send Emergency SMS */
   ESP_LOGI(TAG, "[SOS STEP 1/3] Sending emergency SMS to %s", sms_number);
+=======
+  ESP_LOGI(TAG, "Sending emergency SMS to %s", sms_number);
+  // Support multiple recipients separated by comma or semicolon
+>>>>>>> Stashed changes
   const std::vector<std::string> recipients =
       split_recipients(std::string(sms_number));
   bool any_sent = false;
@@ -2411,11 +2417,18 @@ extern "C" void gl868_modem_trigger_emergency(const char *source,
                     "storage and available space");
     }
   }
+<<<<<<< Updated upstream
 
   /* STEP 3: Post HTTP JSON Telemetry Packet */
   ESP_LOGI(TAG, "[SOS STEP 3/3] Posting SOS HTTP JSON telemetry packet over GPRS...");
   if (!post_telemetry_packet("sos", fix_info, batt)) {
     ESP_LOGW(TAG, "SOS telemetry HTTP upload failed or rate-limited");
+=======
+  /* Always upload SOS HTTP JSON packet over GPRS regardless of GNSS fix availability */
+  if (!post_telemetry_packet("sos", fix_info, batt)) {
+    ESP_LOGW(TAG,
+             "SOS telemetry HTTP upload failed; continuing with SMS and call");
+>>>>>>> Stashed changes
   }
 }
 

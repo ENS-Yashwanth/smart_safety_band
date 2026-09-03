@@ -53,7 +53,7 @@ menu "Smart Safety Band configuration"
     config SAFETY_BAND_HTTP_URL
         string "HTTP telemetry endpoint"
         #default "http://my-esp32-test.free.beeceptor.com"
-        default "http://my-esp32-test.free.beeceptor.com/api/v1/events/normalized"
+        default "http://qtc693f0d3f5cf15a2f982f7fcca.free.beeceptor.com/api/v1/events/normalized"
         #default "http://echo.free.beeceptor.com"
         depends on SAFETY_BAND_HTTP_UPLOAD
         help
