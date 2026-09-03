@@ -2320,12 +2320,18 @@ extern "C" void gl868_modem_trigger_emergency(const char *source,
 
   GpsFixInfo fix_info;
   const bool gps_ok = wait_for_gps_fix(fix_info, SOS_GPS_QUALITY_TIMEOUT_MS);
-  if (!gps_ok) {
+  if (gps_ok) {
+    ESP_LOGI(TAG,
+             "SOS GNSS fix valid: sending emergency alerts with coordinates (%.6f, %.6f)",
+             fix_info.latitude, fix_info.longitude);
+  } else {
     ESP_LOGW(TAG,
-             "No GNSS fix meeting the %.1f m SOS accuracy limit within %u "
-             "seconds; sending alert without coordinates",
-             GPS_MAXIMUM_ACCURACY_METERS,
+             "No GNSS fix within %u sec; sending SOS alert with fallback "
+             "coordinates (0.0, 0.0)",
              static_cast<unsigned>(SOS_GPS_QUALITY_TIMEOUT_MS / 1000U));
+    fix_info.valid = false;
+    fix_info.latitude = 0.0;
+    fix_info.longitude = 0.0;
     gl868_modem_request_deferred_gps_upload();
   }
 
@@ -2353,11 +2359,14 @@ extern "C" void gl868_modem_trigger_emergency(const char *source,
   } else {
     snprintf(
         message, sizeof(message),
-        "ALERT: SOS activated! Loc: unavailable. Map: unavailable Batt: %d%%",
+        "ALERT: SOS activated! Loc: 0.000000,0.000000. Map: "
+        "[https://maps.google.com/?q=0.000000,0.000000] "
+        "(https://maps.google.com/?q=0.000000,0.000000) Batt: %d%%",
         batt >= 0 ? batt : 0);
   }
 
-  if (gps_ok && !post_telemetry_packet("sos", fix_info, batt)) {
+  /* Always upload SOS HTTP JSON packet over GPRS regardless of GNSS fix availability */
+  if (!post_telemetry_packet("sos", fix_info, batt)) {
     ESP_LOGW(TAG,
              "SOS telemetry HTTP upload failed; continuing with SMS and call");
   }
