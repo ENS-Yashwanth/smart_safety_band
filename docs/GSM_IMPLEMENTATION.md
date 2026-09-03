@@ -33,27 +33,27 @@ sequenceDiagram
     User->>Task: SOS Button Trigger Interrupt
     
     Note over Task, Phone: STEP 1: Emergency SMS Dispatch
-    Task->>Modem: AT+CMGF=1\r (Set SMS Text Mode)
-    Modem-->>Task: OK
-    Task->>Modem: AT+CMGS="+91XXXXXXXXXX"\r
-    Modem-->>Task: > (Prompt)
-    Task->>Modem: ALERT: SOS activated! Loc: lat,lon. Map: https://maps.google.com/?q=lat,lon <Ctrl+Z>
-    Modem-->>Phone: Deliver Emergency SMS
-    Modem-->>Task: +CMGS: <mr> OK
+    Task->>Modem: AT+CMGF=1 (Set SMS Text Mode)
+    Modem->>Task: OK
+    Task->>Modem: AT+CMGS="+91XXXXXXXXXX"
+    Modem->>Task: Prompt Ready
+    Task->>Modem: ALERT: SOS activated! Loc: lat,lon
+    Modem->>Phone: Deliver Emergency SMS
+    Modem->>Task: +CMGS: OK
     
     Note over Task, Phone: STEP 2: Emergency Voice Call & Recording
-    Task->>Modem: ATD+91XXXXXXXXXX;\r (Initiate Call)
-    Modem-->>Phone: Ring Recipient
-    Phone-->>Modem: Call Answered
-    Modem-->>Task: VOICE CALL: BEGIN
+    Task->>Modem: ATD+91XXXXXXXXXX (Initiate Call)
+    Modem->>Phone: Ring Recipient
+    Phone->>Modem: Call Answered
+    Modem->>Task: VOICE CALL: BEGIN
     Task->>Modem: Start 60s Local Audio Recording
-    Task->>Modem: ATH\r (Hangup Call after 60s)
-    Modem-->>Phone: Call Ended
+    Task->>Modem: ATH (Hangup Call after 60s)
+    Modem->>Phone: Call Ended
     
     Note over Task, Server: STEP 3: HTTP JSON Telemetry Packet
     Task->>Modem: AT+HTTPINIT & AT+HTTPACTION=1
-    Modem-->>Server: HTTP POST /api/v1/events/normalized (JSON Payload)
-    Server-->>Modem: HTTP 200 OK
+    Modem->>Server: HTTP POST /api/v1/events/normalized
+    Server->>Modem: HTTP 200 OK
 ```
 
 ---
