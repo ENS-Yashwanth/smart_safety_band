@@ -37,8 +37,9 @@
 #define SOS_BUTTON_GPIO ((gpio_num_t)CONFIG_SAFETY_BAND_SOS_GPIO)
 #define MOTION_INT_GPIO ((gpio_num_t)CONFIG_SAFETY_BAND_MOTION_INT_GPIO)
 #define I2C_TIMEOUT_MS 100
-#define COMMUNICATION_QUEUE_DEPTH 8
-#define GPS_UPDATE_INTERVAL_MS (3 * 60 * 1000)
+#define COMMUNICATION_QUEUE_DEPTH 32
+#define GPS_UPDATE_INTERVAL_MS (2 * 60 * 1000)
+#define SOS_LOCATION_UPDATE_INTERVAL_MS (5 * 1000)
 #define SOS_DEBOUNCE_MS 60
 
 #define BIT_MODEM_READY BIT0
@@ -49,20 +50,26 @@ static const char *TAG = "SMART_SAFETY_BAND_001";
 typedef enum { COMM_EVENT_EMERGENCY, COMM_EVENT_GPS_UPLOAD, COMM_EVENT_LIVE_TRACKING } communication_event_type_t;
 typedef struct { communication_event_type_t type; const char *source; } communication_event_t;
 
-static SemaphoreHandle_t s_i2c_mutex;
 static SemaphoreHandle_t s_sos_sem;
 static QueueHandle_t s_communication_events;
 static EventGroupHandle_t s_system_events;
 static const int s_sos_button_idle_level = 1;
 static const int s_sos_button_active_level = 0;
 static int s_sos_button_last_level = 1;
+static volatile bool s_sos_active = false;
 
-static void queue_communication_event(communication_event_type_t type, const char *source)
+static bool queue_communication_event(communication_event_type_t type, const char *source)
 {
+    if (type == COMM_EVENT_GPS_UPLOAD && uxQueueMessagesWaiting(s_communication_events) > 0) {
+        return false;
+    }
+
     const communication_event_t event = {.type = type, .source = source};
     if (xQueueSend(s_communication_events, &event, 0) != pdPASS) {
         ESP_LOGW(TAG, "Communication queue full; dropped %s", source);
+        return false;
     }
+    return true;
 }
 
 void gl868_modem_request_deferred_gps_upload(void)
@@ -120,31 +127,38 @@ static void communication_task(void *argument)
         if (xQueueReceive(s_communication_events, &event, portMAX_DELAY) != pdTRUE) continue;
         if (event.type == COMM_EVENT_EMERGENCY) {
             ESP_LOGW(TAG, "SOS emergency received from %s", event.source);
+            s_sos_active = true;
             gl868_modem_trigger_emergency(event.source, 0);
         } else if (event.type == COMM_EVENT_GPS_UPLOAD) {
-            double latitude = 0.0;
-            double longitude = 0.0;
-            if (!gl868_modem_get_gps_coordinates(&latitude, &longitude)) {
-                ESP_LOGW(TAG, "No valid GPS fix");
-                continue;
+            if (!gl868_modem_upload_telemetry(event.source)) {
+                ESP_LOGW(TAG, "HTTP telemetry upload failed");
             }
-            const int battery = gl868_modem_get_battery_percent();
-            ESP_LOGI(TAG, "GPS sample: %.6f,%.6f (battery=%d%%)", latitude, longitude, battery);
         } else if (event.type == COMM_EVENT_LIVE_TRACKING) {
             ESP_LOGI(TAG, "Sending scheduled live location");
-            if (!gl868_modem_send_live_location()) {
+            if (!gl868_modem_upload_telemetry("live_tracking")) {
                 ESP_LOGW(TAG, "Scheduled live location was not sent");
             }
         }
     }
 }
 
-/* Schedules three-minute live-location SMS updates without competing for modem UART. */
+static void sos_location_update_task(void *argument)
+{
+    xEventGroupWaitBits(s_system_events, BIT_MODEM_READY, pdFALSE, pdTRUE, portMAX_DELAY);
+    for (;;) {
+        if (s_sos_active) {
+            queue_communication_event(COMM_EVENT_GPS_UPLOAD, "sos.updated");
+        }
+        vTaskDelay(pdMS_TO_TICKS(SOS_LOCATION_UPDATE_INTERVAL_MS));
+    }
+}
+
+/* Schedules two-minute live-location uploads without competing for modem UART. */
 static void gps_task(void *argument)
 {
     xEventGroupWaitBits(s_system_events, BIT_MODEM_READY, pdFALSE, pdTRUE, portMAX_DELAY);
     for (;;) {
-        queue_communication_event(COMM_EVENT_LIVE_TRACKING, "three-minute live tracking update");
+        queue_communication_event(COMM_EVENT_LIVE_TRACKING, "two-minute live tracking update");
         vTaskDelay(pdMS_TO_TICKS(GPS_UPDATE_INTERVAL_MS));
     }
 }
@@ -171,16 +185,17 @@ static __attribute__((unused)) void sos_button_task(void *argument)
 
 void app_main(void)
 {
-    s_i2c_mutex = xSemaphoreCreateMutex(); 
     s_sos_sem = xSemaphoreCreateBinary();
     s_communication_events = xQueueCreate(COMMUNICATION_QUEUE_DEPTH, sizeof(communication_event_t));
     s_system_events = xEventGroupCreate();
-    configASSERT(s_i2c_mutex && s_sos_sem && s_communication_events && s_system_events);
+    configASSERT(s_sos_sem && s_communication_events && s_system_events);
     init_io();
     xTaskCreate(communication_task, "communication", 6144, NULL, 10, NULL);
     ESP_LOGI(TAG, "Communication task started for modem UART access");
     xTaskCreate(sos_button_task, "sos_button", 2048, NULL, 8, NULL);
     ESP_LOGI(TAG, "SOS button task started on GPIO %d", SOS_BUTTON_GPIO);
     xTaskCreate(gps_task, "gps_upload", 3072, NULL, 4, NULL);
-    ESP_LOGI(TAG, "GPS live-tracking task started; updates every 3 minutes");
+    ESP_LOGI(TAG, "GPS telemetry task started; uploads every 2 minutes");
+    xTaskCreate(sos_location_update_task, "sos_location", 3072, NULL, 4, NULL);
+    ESP_LOGI(TAG, "GPRS / SOS location update task started; uploads every 5 seconds while SOS is active");
 }
