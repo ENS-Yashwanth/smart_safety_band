@@ -2365,14 +2365,8 @@ extern "C" void gl868_modem_trigger_emergency(const char *source,
         batt >= 0 ? batt : 0);
   }
 
-  /* Always upload SOS HTTP JSON packet over GPRS regardless of GNSS fix availability */
-  if (!post_telemetry_packet("sos", fix_info, batt)) {
-    ESP_LOGW(TAG,
-             "SOS telemetry HTTP upload failed; continuing with SMS and call");
-  }
-
-  ESP_LOGI(TAG, "Sending emergency SMS to %s", sms_number);
-  // Support multiple recipients separated by comma or semicolon
+  /* STEP 1: Send Emergency SMS */
+  ESP_LOGI(TAG, "[SOS STEP 1/3] Sending emergency SMS to %s", sms_number);
   const std::vector<std::string> recipients =
       split_recipients(std::string(sms_number));
   bool any_sent = false;
@@ -2393,11 +2387,12 @@ extern "C" void gl868_modem_trigger_emergency(const char *source,
   }
   vTaskDelay(pdMS_TO_TICKS(2000));
 
+  /* STEP 2: Initiate Emergency Call */
   log_modem_storage("before pre-call cleanup");
   clear_modem_user_files();
   log_modem_storage("after pre-call cleanup");
 
-  ESP_LOGI(TAG, "Initiating emergency call to %s", call_number);
+  ESP_LOGI(TAG, "[SOS STEP 2/3] Initiating emergency call to %s", call_number);
   log_call_preflight();
   const bool call_ok = make_call(call_number);
   if (!call_ok) {
@@ -2415,6 +2410,12 @@ extern "C" void gl868_modem_trigger_emergency(const char *source,
                     "modem-local recording failed; check modem filesystem "
                     "storage and available space");
     }
+  }
+
+  /* STEP 3: Post HTTP JSON Telemetry Packet */
+  ESP_LOGI(TAG, "[SOS STEP 3/3] Posting SOS HTTP JSON telemetry packet over GPRS...");
+  if (!post_telemetry_packet("sos", fix_info, batt)) {
+    ESP_LOGW(TAG, "SOS telemetry HTTP upload failed or rate-limited");
   }
 }
 

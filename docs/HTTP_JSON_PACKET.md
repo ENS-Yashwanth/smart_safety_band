@@ -13,7 +13,7 @@ The HTTP JSON telemetry pipeline serves two primary application functions in the
    * **Usage**: Continuously streams device location, battery state, and sensor telemetry to the Smart City Ingestion Service.
 2. **Emergency SOS Incident Reporting**:
    * **Trigger**: Pressing the physical hardware SOS button (GPIO 4).
-   * **Usage**: Immediately uploads a high-priority `sos.triggered` event to the central command center for emergency dispatch before initiating GSM voice calls and SMS alerts.
+   * **Usage**: Immediately uploads a high-priority `sos.triggered` event to the central command center for emergency dispatch after initiating GSM voice calls and SMS alerts.
 
 ---
 
