@@ -13,26 +13,48 @@ The machine-readable contract is
 Send each complete JSON event with:
 
 ```http
-POST /api/ingestion/api/v1/events/normalized HTTP/1.1
+POST /api/v1/events/normalized HTTP/1.1
 Content-Type: application/json
 ```
 
-That path is the Command Center proxy used by the demo. With the local demo
-port-forward, the full URL is:
+For vendor testing, use the SIM868-compatible Beeceptor endpoint supplied by
+the ICCC team:
 
 ```text
-http://127.0.0.1:8083/api/ingestion/api/v1/events/normalized
+https://<beeceptor-endpoint>.free.beeceptor.com/api/v1/events/normalized
 ```
 
-Inside Kubernetes, the adapter uses:
+Beeceptor Local Tunnel forwards the request to the local event-ingestion
+port-forward and returns the real ingestion response to the band. A Beeceptor
+mock rule must not match this path: mock rules take priority and would return a
+mocked response without delivering the event to ICCC. The endpoint is
+intentionally unauthenticated for the time-boxed demo, so the ICCC team must
+stop the tunnel after testing.
+
+The ICCC team starts the local and public tunnels in separate terminals:
+
+```bash
+k3s kubectl -n smart-city port-forward service/event-ingestion 8082:8080
+```
+
+```bash
+export BEECEPTOR_ENDPOINT=my-esp32-test
+./scripts/expose-smart-band-ingestion-beeceptor.sh
+```
+
+The local-only equivalent is
+`http://127.0.0.1:8082/api/v1/events/normalized`. Inside Kubernetes, the
+adapter uses:
 
 ```text
 http://event-ingestion:8080/api/v1/events/normalized
 ```
 
-The public HTTPS base URL and authentication mechanism are not implemented yet
-and must be agreed before production. Do not integrate a physical device with
-the `/simulate/*` endpoints; those control only the fake band.
+The Command Center continues to proxy ingestion internally at
+`http://192.168.10.228:8083/api/ingestion/api/v1/events/normalized`. The
+Beeceptor tunnel does not expose the Command Center or its `/simulate/*`
+fake-band controls.
+Do not treat this unauthenticated demo tunnel as a production integration.
 
 A successful response wraps the complete accepted event (abbreviated here):
 
@@ -48,8 +70,13 @@ create another incident.
 curl --fail-with-body -X POST \
   -H 'Content-Type: application/json' \
   --data @smart-band-event.json \
-  'http://127.0.0.1:8083/api/ingestion/api/v1/events/normalized'
+  'https://<beeceptor-endpoint>.free.beeceptor.com/api/v1/events/normalized'
 ```
+
+The Beeceptor free tunnel is limited to 50 requests per day. Do not enable the
+10-second heartbeat or continuous location update schedule on the free plan;
+use it only for manual SOS integration tests or obtain a plan sized for the
+expected event volume.
 
 Before vendor testing, the ICCC team must configure the adapter with the stable
 band ID. Adapter startup registers the device and provisions the critical
@@ -58,8 +85,16 @@ the analytics event but will not automatically create the intended incident.
 
 ## Audio delivery
 
+Audio is optional for `sos.triggered`. An SOS without audio is still accepted
+and creates the same critical incident. When no clip is available, send an
+empty `evidence` array and omit `payload.audio` entirely; do not send it as
+`null`. If audio metadata is present, a matching audio evidence entry is
+required.
+
 Do not put audio bytes, chunks, or base64 in JSON. The current receiver has no
 multipart or raw-audio upload endpoint.
+
+When a clip is available:
 
 1. The band streams its vendor-specific audio packets to the vendor gateway.
 2. The gateway assembles one complete short clip and exposes it through an
@@ -139,6 +174,8 @@ also determines offline state when heartbeats stop for the agreed timeout.
 
 ## 2. SOS triggered
 
+The following example includes optional audio:
+
 ```json
 {
   "schema_version": "smart-city-event/1.0",
@@ -180,6 +217,19 @@ also determines offline state when heartbeats stop for the agreed timeout.
       "size_bytes": 24044
     }
   }
+}
+```
+
+When audio is unavailable, use the same event with these fields instead:
+
+```json
+"evidence": [],
+"payload": {
+  "band_id": "band-demo-001",
+  "trigger": "button",
+  "sos_status": "triggered",
+  "location_source": "gps",
+  "altitude_m": null
 }
 ```
 
