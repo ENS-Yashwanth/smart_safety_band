@@ -7,6 +7,7 @@
 #include <ctime>
 #include <memory>
 #include <string>
+#include <sys/time.h>
 #include <vector>
 
 #include "driver/gpio.h"
@@ -63,9 +64,11 @@ static void toggle_status_led(void) {
   gpio_set_level(GPIO_NUM_47, s_status_led_level ? 1 : 0);
 }
 
-extern "C" void gl868_modem_set_status_led(bool gps_fix) {
-  s_status_led_level = !gps_fix;
-    gpio_set_level(GPIO_NUM_47, s_status_led_level ? 1 : 0);
+extern "C" void gl868_modem_set_status_led(bool modem_ready) {
+  /* Visual indicator: ON while GSM modem is ready, OFF once GPS fix is
+   * confirmed and used as the final user-facing confirmation. */
+  s_status_led_level = modem_ready;
+  gpio_set_level(GPIO_NUM_47, s_status_led_level ? 1 : 0);
 }
 
 static const char *http_upload_device_id(void);
@@ -571,6 +574,89 @@ struct GpsFixInfo {
   int satellites_used = -1;
   std::string timestamp;
 };
+
+static GpsFixInfo s_last_good_fix;
+
+static bool set_system_time_from_epoch(time_t epoch_seconds)
+{
+    if (epoch_seconds <= 0) {
+        return false;
+    }
+    struct timeval tv {
+        .tv_sec = epoch_seconds,
+        .tv_usec = 0,
+    };
+    return settimeofday(&tv, nullptr) == 0;
+}
+
+static bool set_system_time_from_clock_string(const std::string &clock_value)
+{
+    std::string value = trim_response(clock_value);
+    const size_t quote1 = value.find('"');
+    const size_t quote2 = (quote1 == std::string::npos) ? std::string::npos : value.find('"', quote1 + 1);
+    if (quote1 == std::string::npos || quote2 == std::string::npos || quote2 <= quote1 + 1) {
+        return false;
+    }
+
+    std::string stamp = value.substr(quote1 + 1, quote2 - quote1 - 1);
+    if (stamp.empty()) {
+        return false;
+    }
+
+    int yy = 0, mon = 0, dd = 0, hh = 0, mm = 0, ss = 0;
+    if (sscanf(stamp.c_str(), "%d/%d/%d,%d:%d:%d", &yy, &mon, &dd, &hh, &mm, &ss) != 6) {
+        return false;
+    }
+
+    if (yy < 100) {
+        yy += (yy < 70) ? 2000 : 1900;
+    }
+
+    struct tm t;
+    std::memset(&t, 0, sizeof(t));
+    t.tm_year = yy - 1900;
+    t.tm_mon = mon - 1;
+    t.tm_mday = dd;
+    t.tm_hour = hh;
+    t.tm_min = mm;
+    t.tm_sec = ss;
+
+    time_t epoch = timegm(&t);
+    if (epoch == (time_t)-1) {
+        epoch = mktime(&t);
+    }
+    if (epoch == (time_t)-1) {
+        return false;
+    }
+    return set_system_time_from_epoch(epoch);
+}
+
+static bool sync_system_time_from_modem_clock(void)
+{
+    std::string response;
+    if (!send_at_command("AT+CCLK?\r", &response, 5000)) {
+        return false;
+    }
+    std::string trimmed = trim_response(response);
+    const size_t cclk = trimmed.find("+CCLK:");
+    if (cclk == std::string::npos) {
+        return false;
+    }
+    return set_system_time_from_clock_string(trimmed.substr(cclk));
+}
+
+static bool sync_system_time_from_gps_fix(const GpsFixInfo &fix)
+{
+    if (!fix.valid || fix.timestamp.empty()) {
+        return false;
+    }
+
+    const double gps_epoch = parse_gnss_timestamp_seconds(fix.timestamp);
+    if (gps_epoch <= 0.0) {
+        return false;
+    }
+    return set_system_time_from_epoch(static_cast<time_t>(gps_epoch));
+}
 
 static bool parse_gps_fix_info_from_cgnsinf(const std::string &cgnsinf, GpsFixInfo &info)
 {
@@ -1107,7 +1193,7 @@ static bool clcc_has_active_call(const std::string &response)
         }
         if (fields.size() < 3) continue;
         int stat = atoi(fields[2].c_str());
-        if (stat == 0 || stat == 1 || stat == 2 || stat == 3 || stat == 5) {
+        if (stat == 0 || stat == 1 || stat == 2 || stat == 3 || stat == 4 || stat == 5) {
             return true;
         }
     }
@@ -1574,6 +1660,10 @@ bool make_call(const std::string &number)
         ESP_LOGW(TAG, "Failed to enable CIURC before dial: %s", trim_response(ciurc_resp).c_str());
       }
     }
+    std::string colp_resp;
+    send_at_command("AT+COLP=1\r", &colp_resp, 1000);
+    std::string clip_resp;
+    send_at_command("AT+CLIP=1\r", &clip_resp, 1000);
 
     /* Small initial delay to allow the modem to begin dialing and produce URCs */
     vTaskDelay(pdMS_TO_TICKS(800));
@@ -1583,6 +1673,7 @@ bool make_call(const std::string &number)
      * not immediately return OK/URC for ATD. */
     const TickType_t start = xTaskGetTickCount();
     const TickType_t deadline = start + pdMS_TO_TICKS(15000);
+    bool saw_dial_accepted = ok || trimmed.find("OK") != std::string::npos;
     while (xTaskGetTickCount() < deadline) {
       std::string clcc_response;
       if (send_at_command("AT+CLCC?\r", &clcc_response, 2000)) {
@@ -1601,8 +1692,16 @@ bool make_call(const std::string &number)
         }
       }
 
+      if (saw_dial_accepted && (trimmed.find("OK") != std::string::npos || !clcc_response.empty())) {
+        /* Keep polling because ATD may be accepted before the modem reports the active call state. */
+      }
+
       /* Short backoff before retrying */
       vTaskDelay(pdMS_TO_TICKS(500));
+    }
+
+    if (saw_dial_accepted) {
+      ESP_LOGW(TAG, "ATD accepted but no active call state was confirmed; modem may still be dialing or carrier may not emit URCs");
     }
 
     /* Final diagnostics before giving up */
@@ -1944,12 +2043,13 @@ extern "C" bool gl868_modem_init(void)
       GpsFixInfo info;
       bool gps_ok = wait_for_gps_fix(info, 45000);
       if (gps_ok) {
+        sync_system_time_from_gps_fix(info);
         ESP_LOGI(TAG, "Background: GPS fix obtained: %.6f, %.6f", info.latitude, info.longitude);
-        /* Indicate GPS fix via status LED */
-        gl868_modem_set_status_led(true);
+        /* GPS fix confirmed: user-facing LED should turn off to indicate ready state. */
+        gl868_modem_set_status_led(false);
       } else {
         ESP_LOGW(TAG, "Background: GPS fix not obtained within timeout");
-        gl868_modem_set_status_led(false);
+        gl868_modem_set_status_led(true);
       }
 
       ESP_LOGI(TAG, "Background: running full SIM868 diagnostics");
@@ -1974,6 +2074,8 @@ extern "C" bool gl868_modem_init(void)
     if (!send_at_command("AT+CMEE=2\r", &response, 3000)) {
       ESP_LOGW(TAG, "Failed to enable verbose modem errors: %s", trim_response(response).c_str());
     }
+
+    sync_system_time_from_modem_clock();
 
     /* Mark initialized and return quickly; remaining long-running checks
      * (network/GPS warmup and full diagnostics) run in background task. */
@@ -2002,10 +2104,20 @@ extern "C" void gl868_modem_trigger_emergency(const char *source) {
   /* Minimal emergency path: do not wait for GPS, SMS, battery or long
    * network registration here. Initiate the voice call immediately to
    * minimize latency; defer non-critical tasks for after dialing. */
-  GpsFixInfo fix_info;
-  fix_info.valid = false;
-  fix_info.latitude = 0.0;
-  fix_info.longitude = 0.0;
+  GpsFixInfo fix_info = s_last_good_fix;
+  if (!fix_info.valid) {
+      double lat = 0.0, lon = 0.0;
+      if (gl868_modem_get_gps_coordinates(&lat, &lon)) {
+          fix_info.valid = true;
+          fix_info.latitude = lat;
+          fix_info.longitude = lon;
+          std::string gps_response;
+          if (get_gps_location(&gps_response, 5000) &&
+              parse_gps_fix_info_from_cgnsinf(gps_response, fix_info)) {
+              /* use modem-reported fix metadata */
+          }
+      }
+  }
   gl868_modem_request_deferred_gps_upload();
 
   ESP_LOGI(TAG, "Initiating emergency call to %s", call_number);
@@ -2070,23 +2182,33 @@ extern "C" bool gl868_modem_upload_telemetry(const char *event_type) {
              "%.6f)",
              latitude, longitude);
   } else {
-    ESP_LOGW(
-        TAG,
-        "GNSS fix pending/unavailable; sending HTTP telemetry with fallback "
-        "coordinates (0.0, 0.0)");
-    latitude = 0.0;
-    longitude = 0.0;
+    if (s_last_good_fix.valid) {
+      latitude = s_last_good_fix.latitude;
+      longitude = s_last_good_fix.longitude;
+      ESP_LOGW(TAG,
+               "GNSS fix pending; using last known fix (%0.6f, %0.6f)",
+               latitude, longitude);
+    } else {
+      ESP_LOGW(
+          TAG,
+          "GNSS fix pending/unavailable; sending HTTP telemetry with fallback "
+          "coordinates (0.0, 0.0)");
+      latitude = 0.0;
+      longitude = 0.0;
+    }
   }
 
   /* Query for optional telemetry metadata; retain corrected/fallback
    * coordinates. */
-  GpsFixInfo fix;
+  GpsFixInfo fix = s_last_good_fix;
   std::string gps_response;
   if (!get_gps_location(&gps_response, 5000) ||
       !parse_gps_fix_info_from_cgnsinf(gps_response, fix)) {
-    fix = GpsFixInfo{};
+    if (!s_last_good_fix.valid) {
+      fix = GpsFixInfo{};
+    }
   }
-  fix.valid = has_gps_fix;
+  fix.valid = (has_gps_fix || s_last_good_fix.valid);
   fix.latitude = latitude;
   fix.longitude = longitude;
   return post_telemetry_packet(event_type, fix,
@@ -2147,6 +2269,9 @@ extern "C" bool gl868_modem_get_gps_coordinates(double *latitude,
              fix.run_status, fix.fix_status, fix.timestamp.c_str());
     return false;
   }
+
+  s_last_good_fix = fix;
+  sync_system_time_from_gps_fix(fix);
 
   bool poor_metadata = (fix.hdop <= 0.0 || fix.hdop > GPS_ACCEPTABLE_HDOP ||
                         fix.satellites_used < GPS_MIN_SATELLITES);

@@ -114,7 +114,7 @@ static void communication_task(void *argument)
             modem_ready = gl868_modem_init();
             if (modem_ready) {
                 xEventGroupSetBits(s_system_events, BIT_MODEM_READY);
-                gl868_modem_set_status_led(false);
+                gl868_modem_set_status_led(true);
                 ESP_LOGI(TAG, "SIM868 ready for emergency and GPS services");
                 ESP_LOGI(TAG, "Boot complete. Emergency SMS recipient: %s", gl868_modem_get_emergency_sms_number());
                 ESP_LOGI(TAG, "Boot complete. Emergency call recipient: %s", gl868_modem_get_emergency_call_number());
