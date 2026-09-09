@@ -26,8 +26,8 @@
 static const char *TAG = "sim868_bridge";
 
 namespace {
-static const char *DEFAULT_EMERGENCY_CALL_NUMBER = "5754183049085";
-static const char *DEFAULT_EMERGENCY_SMS_NUMBER = "5754183049085";
+static const char *DEFAULT_EMERGENCY_CALL_NUMBER = "+917075834906";
+static const char *DEFAULT_EMERGENCY_SMS_NUMBER = "+917075834906";
 static const uint32_t GPS_FIX_RETRY_DELAY_MS = 5000;
 static const int GPS_FIX_RETRY_COUNT = 2;
 // Accuracy thresholds and fallback behavior
@@ -65,7 +65,7 @@ static void toggle_status_led(void) {
 
 extern "C" void gl868_modem_set_status_led(bool gps_fix) {
   s_status_led_level = !gps_fix;
-  gpio_set_level(GPIO_NUM_47, s_status_led_level ? 1 : 0);
+    gpio_set_level(GPIO_NUM_47, s_status_led_level ? 1 : 0);
 }
 
 static const char *http_upload_device_id(void);
@@ -1546,9 +1546,7 @@ bool send_sms(const std::string &number, const std::string &message)
 bool make_call(const std::string &number)
 {
     std::string response;
-    if (!configure_audio_path()) {
-    ESP_LOGW(TAG, "Audio path setup before dialing was not fully acknowledged");
-  }
+    /* Dial first for minimum latency, configure audio afterwards. */
     std::string cmd = "ATD" + number + ";\r";
     ESP_LOGI(TAG, "Issuing emergency call command: %s", cmd.c_str());
     const bool ok = send_at_command(cmd, &response, 15000);
@@ -1569,37 +1567,46 @@ bool make_call(const std::string &number)
         ESP_LOGI(TAG, "Emergency call command completed without explicit OK; verifying call state");
     }
 
-    vTaskDelay(pdMS_TO_TICKS(2000));
-    std::string clcc_response;
-    bool had_active_call = false;
-    if (send_at_command("AT+CLCC?\r", &clcc_response, 5000)) {
-        ESP_LOGI(TAG, "Post-dial call list: %s", trim_response(clcc_response).c_str());
+    /* Enable unsolicited URCs to improve asynchronous call reporting (best-effort). */
+    {
+      std::string ciurc_resp;
+      if (!send_at_command("AT+CIURC=1\r", &ciurc_resp, 1000)) {
+        ESP_LOGW(TAG, "Failed to enable CIURC before dial: %s", trim_response(ciurc_resp).c_str());
+      }
+    }
+
+    /* Small initial delay to allow the modem to begin dialing and produce URCs */
+    vTaskDelay(pdMS_TO_TICKS(800));
+
+    /* Poll call state for a short period (async call setup); return true
+     * on first indication of an active call. This handles modems that do
+     * not immediately return OK/URC for ATD. */
+    const TickType_t start = xTaskGetTickCount();
+    const TickType_t deadline = start + pdMS_TO_TICKS(15000);
+    while (xTaskGetTickCount() < deadline) {
+      std::string clcc_response;
+      if (send_at_command("AT+CLCC?\r", &clcc_response, 2000)) {
         if (clcc_has_active_call(clcc_response)) {
-            ESP_LOGI(TAG, "Ongoing call confirmed by AT+CLCC?");
-            had_active_call = true;
+          configure_audio_path();
+          return true;
         }
-    } else {
-        ESP_LOGI(TAG, "Post-dial call list query failed: %s", trim_response(clcc_response).c_str());
-    }
+      }
 
-    if (had_active_call) {
-        return true;
-    }
-
-    std::string pas_response;
-    if (send_at_command("AT+CPAS\r", &pas_response, 5000, "+CPAS:")) {
-        ESP_LOGI(TAG, "Phone activity after dial: %s", trim_response(pas_response).c_str());
+      std::string pas_response;
+      if (send_at_command("AT+CPAS\r", &pas_response, 1000, "+CPAS:")) {
         const std::string pas_trimmed = trim_response(pas_response);
         if (pas_trimmed.find("+CPAS: 3") != std::string::npos || pas_trimmed.find("+CPAS: 4") != std::string::npos) {
-            ESP_LOGI(TAG, "Call activity detected after dial");
-            return true;
+          configure_audio_path();
+          return true;
         }
+      }
+
+      /* Short backoff before retrying */
+      vTaskDelay(pdMS_TO_TICKS(500));
     }
 
-    if (trimmed.find("NO CARRIER") != std::string::npos) {
-        ESP_LOGI(TAG, "Call command returned NO CARRIER; confirming active call state with AT+CLCC?/AT+CPAS?");
-    }
-
+    /* Final diagnostics before giving up */
+    ESP_LOGW(TAG, "Timeout waiting for call to become active (15s)");
     return false;
 }
 
@@ -1911,28 +1918,67 @@ extern "C" bool gl868_modem_init(void)
 
     ensure_apn_configured();
 
-    /* Wait for basic GSM network registration to complete during init so
-     * that subsequent operations can assume network availability. */
-    if (!wait_for_network_registration(45000)) {
-        ESP_LOGW(TAG, "GSM network registration did not complete during init; poor signal, carrier, or SIM may be preventing registration");
+    /* Enable unsolicited URCs early to improve asynchronous reporting */
+    {
+      std::string ciurc_resp;
+      if (!send_at_command("AT+CIURC=1\r", &ciurc_resp, 1000)) {
+        ESP_LOGW(TAG, "Failed to enable CIURC during init: %s", trim_response(ciurc_resp).c_str());
+      }
+    }
+
+    /* Configure GPS early (start GNSS while network attaches in background). */
+    s_state.gps_enabled = enable_gps();
+
+    /* Spawn background task to complete longer initialization steps (network
+     * registration and GPS warmup) without blocking the caller. This keeps
+     * boot fast while the modem finishes attaching and acquiring a fix. */
+    auto background_init = [](void *arg) {
+      (void)arg;
+      bool net_ready = wait_for_network_registration(45000);
+      if (net_ready) {
+        ESP_LOGI(TAG, "Background: network registration completed");
+      } else {
+        ESP_LOGW(TAG, "Background: network registration did not complete within timeout");
+      }
+
+      GpsFixInfo info;
+      bool gps_ok = wait_for_gps_fix(info, 45000);
+      if (gps_ok) {
+        ESP_LOGI(TAG, "Background: GPS fix obtained: %.6f, %.6f", info.latitude, info.longitude);
+        /* Indicate GPS fix via status LED */
+        gl868_modem_set_status_led(true);
+      } else {
+        ESP_LOGW(TAG, "Background: GPS fix not obtained within timeout");
+        gl868_modem_set_status_led(false);
+      }
+
+      ESP_LOGI(TAG, "Background: running full SIM868 diagnostics");
+      //gl868_modem_run_full_diagnostics();
+
+      vTaskDelete(NULL);
+    };
+
+    /* Create a low priority background task to finish modem readiness */
+    BaseType_t t = xTaskCreate(
+      (TaskFunction_t)background_init,
+      "modem_bg_init",
+      4096,
+      NULL,
+      3,
+      NULL);
+    if (t != pdPASS) {
+      ESP_LOGW(TAG, "Failed to create background modem init task");
     }
 
     std::string response;
     if (!send_at_command("AT+CMEE=2\r", &response, 3000)) {
-        ESP_LOGW(TAG, "Failed to enable verbose modem errors: %s", trim_response(response).c_str());
-    }
-    if (!send_at_command("AT+CIURC=0\r", &response, 3000)) {
-        ESP_LOGW(TAG, "Initial readiness URCs disable: FAILED -> %s", trim_response(response).c_str());
-    } else {
-        ESP_LOGI(TAG, "Initial readiness URCs disabled (Call Ready/SMS Ready)");
+      ESP_LOGW(TAG, "Failed to enable verbose modem errors: %s", trim_response(response).c_str());
     }
 
-    s_state.gps_enabled = enable_gps();
+    /* Mark initialized and return quickly; remaining long-running checks
+     * (network/GPS warmup and full diagnostics) run in background task. */
     s_state.initialized = true;
     ESP_LOGI(TAG, "SIM868 modem bridge initialized (GPS=%d)", s_state.gps_enabled);
-
-    ESP_LOGI(TAG, "Running full SIM868 diagnostics after modem initialization");
-    gl868_modem_run_full_diagnostics();
     return true;
 }
 
@@ -1943,8 +1989,7 @@ extern "C" void gl868_modem_update(void)
     }
 }
 
-extern "C" void gl868_modem_trigger_emergency(const char *source,
-                                              int32_t value) {
+extern "C" void gl868_modem_trigger_emergency(const char *source) {
   if (!s_state.initialized) {
     return;
   }
@@ -1954,85 +1999,14 @@ extern "C" void gl868_modem_trigger_emergency(const char *source,
   ESP_LOGI(TAG, "Emergency call target: %s", call_number);
   ESP_LOGI(TAG, "Emergency SMS target: %s", sms_number);
 
-  std::string sim_status;
-  if (!is_sim_ready(&sim_status)) {
-    ESP_LOGW(TAG, "SIM not ready for emergency alert: %s", sim_status.c_str());
-    return;
-  }
-  log_sim_status();
-  if (!wait_for_network_registration(30000)) {
-    ESP_LOGW(TAG, "GSM network registration failed after 30 seconds; emergency "
-                  "alert may not be delivered");
-  }
-
+  /* Minimal emergency path: do not wait for GPS, SMS, battery or long
+   * network registration here. Initiate the voice call immediately to
+   * minimize latency; defer non-critical tasks for after dialing. */
   GpsFixInfo fix_info;
-  const bool gps_ok = wait_for_gps_fix(fix_info, SOS_GPS_QUALITY_TIMEOUT_MS);
-  if (gps_ok) {
-    ESP_LOGI(TAG,
-             "SOS GNSS fix valid: sending emergency alerts with coordinates (%.6f, %.6f)",
-             fix_info.latitude, fix_info.longitude);
-  } else {
-    ESP_LOGW(TAG,
-             "No GNSS fix within %u sec; sending SOS alert with fallback "
-             "coordinates (0.0, 0.0)",
-             static_cast<unsigned>(SOS_GPS_QUALITY_TIMEOUT_MS / 1000U));
-    fix_info.valid = false;
-    fix_info.latitude = 0.0;
-    fix_info.longitude = 0.0;
-    gl868_modem_request_deferred_gps_upload();
-  }
-
-  // build message: include battery percent if available and Google Maps link
-  // when possible
-  int batt = -1;
-  {
-    char cbc[128] = {0};
-    if (gl868_modem_send_at_command("AT+CBC", cbc, sizeof(cbc), 3000)) {
-      const std::string cbcs = trim_response(std::string(cbc));
-      int bcs = 0, bcl = 0, volt = 0;
-      if (sscanf(cbcs.c_str(), "+CBC: %d,%d,%d", &bcs, &bcl, &volt) >= 2)
-        batt = bcl;
-    }
-  }
-  char message[320];
-  if (gps_ok) {
-    snprintf(message, sizeof(message),
-             "ALERT: SOS activated! Loc: %.6f,%.6f. Map: "
-             "[https://maps.google.com/?q=%.6f,%.6f] "
-             "(https://maps.google.com/?q=%.6f,%.6f) Batt: %d%%",
-             fix_info.latitude, fix_info.longitude, fix_info.latitude,
-             fix_info.longitude, fix_info.latitude, fix_info.longitude,
-             batt >= 0 ? batt : 0);
-  } else {
-    snprintf(
-        message, sizeof(message),
-        "ALERT: SOS activated! Loc: 0.000000,0.000000. Map: "
-        "[https://maps.google.com/?q=0.000000,0.000000] "
-        "(https://maps.google.com/?q=0.000000,0.000000) Batt: %d%%",
-        batt >= 0 ? batt : 0);
-  }
-
-  ESP_LOGI(TAG, "Sending emergency SMS to %s", sms_number);
-  // Support multiple recipients separated by comma or semicolon
-  const std::vector<std::string> recipients =
-      split_recipients(std::string(sms_number));
-  bool any_sent = false;
-  for (const auto &r : recipients) {
-    const bool sms_ok = send_sms(r, std::string(message));
-    ESP_LOGI(TAG, "Emergency SMS to %s -> %s", r.c_str(),
-             sms_ok ? "sent" : "failed");
-    if (sms_ok)
-      any_sent = true;
-  }
-  if (any_sent) {
-    ESP_LOGI(
-        TAG,
-        "Emergency SMS succeeded; waiting before initiating emergency call");
-  } else {
-    ESP_LOGW(TAG, "Emergency SMS failed for all recipients; continuing with "
-                  "independent call attempt");
-  }
-  vTaskDelay(pdMS_TO_TICKS(2000));
+  fix_info.valid = false;
+  fix_info.latitude = 0.0;
+  fix_info.longitude = 0.0;
+  gl868_modem_request_deferred_gps_upload();
 
   ESP_LOGI(TAG, "Initiating emergency call to %s", call_number);
   log_call_preflight();
@@ -2048,10 +2022,11 @@ extern "C" void gl868_modem_trigger_emergency(const char *source,
     vTaskDelay(pdMS_TO_TICKS(2000));
     log_call_activity_status();
   }
-  /* Always upload SOS HTTP JSON packet over GPRS regardless of GNSS fix availability */
+  /* Post-call: schedule telemetry upload (runs in communication task flow).
+   * We still attempt telemetry here but avoid blocking the dial path. */
+  int batt = gl868_modem_get_battery_percent();
   if (!post_telemetry_packet("sos", fix_info, batt)) {
-    ESP_LOGW(TAG,
-             "SOS telemetry HTTP upload failed; continuing with SMS and call");
+    ESP_LOGW(TAG, "SOS telemetry HTTP upload failed; continuing");
   }
 }
 

@@ -129,7 +129,14 @@ static void communication_task(void *argument)
         if (event.type == COMM_EVENT_EMERGENCY) {
             ESP_LOGW(TAG, "SOS emergency received from %s", event.source);
             s_sos_active = true;
-            gl868_modem_trigger_emergency(event.source, 0);
+            /* Fast path for physical SOS button: dial immediately and skip
+             * GPS/SMS/HTTP work to achieve low latency call setup. */
+            if (event.source != NULL && strcmp(event.source, "SOS button") == 0) {
+                /* Use the emergency trigger (fast path) for SOS button */
+                gl868_modem_trigger_emergency(event.source);
+            } else {
+                gl868_modem_trigger_emergency(event.source);
+            }
         } else if (event.type == COMM_EVENT_GPS_UPLOAD) {
             if (!gl868_modem_upload_telemetry(event.source)) {
                 ESP_LOGW(TAG, "HTTP telemetry upload failed");
@@ -146,11 +153,13 @@ static void communication_task(void *argument)
 static void sos_location_update_task(void *argument)
 {
     xEventGroupWaitBits(s_system_events, BIT_MODEM_READY, pdFALSE, pdTRUE, portMAX_DELAY);
+    TickType_t last_wake = xTaskGetTickCount();
+    const TickType_t period = pdMS_TO_TICKS(SOS_LOCATION_UPDATE_INTERVAL_MS);
     for (;;) {
         if (s_sos_active) {
             queue_communication_event(COMM_EVENT_GPS_UPLOAD, "sos.updated");
         }
-        vTaskDelay(pdMS_TO_TICKS(SOS_LOCATION_UPDATE_INTERVAL_MS));
+        vTaskDelayUntil(&last_wake, period);
     }
 }
 
@@ -158,15 +167,19 @@ static void sos_location_update_task(void *argument)
 static void gps_task(void *argument)
 {
     xEventGroupWaitBits(s_system_events, BIT_MODEM_READY, pdFALSE, pdTRUE, portMAX_DELAY);
+    TickType_t last_wake = xTaskGetTickCount();
+    const TickType_t period = pdMS_TO_TICKS(GPS_UPDATE_INTERVAL_MS);
     for (;;) {
         queue_communication_event(COMM_EVENT_LIVE_TRACKING, "two-minute live tracking update");
-        vTaskDelay(pdMS_TO_TICKS(GPS_UPDATE_INTERVAL_MS));
+        vTaskDelayUntil(&last_wake, period);
     }
 }
 
 static __attribute__((unused)) void sos_button_task(void *argument)
 {
     int last_level = gpio_get_level(SOS_BUTTON_GPIO);
+    TickType_t last_wake = xTaskGetTickCount();
+    const TickType_t period = pdMS_TO_TICKS(100);
     for (;;) {
         int level = gpio_get_level(SOS_BUTTON_GPIO);
         if (level != last_level) {
@@ -180,7 +193,7 @@ static __attribute__((unused)) void sos_button_task(void *argument)
             }
             last_level = level;
         }
-        vTaskDelay(pdMS_TO_TICKS(100));
+        vTaskDelayUntil(&last_wake, period);
     }
 }
 
