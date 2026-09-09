@@ -6,6 +6,7 @@ extern "C" {
 
 bool gl868_modem_init(void);
 void gl868_modem_update(void);
+void gl868_modem_set_status_led(bool gps_fix);
 void gl868_modem_trigger_emergency(const char *source, int32_t value);
 bool gl868_modem_send_at_command(const char *command, char *response, size_t response_len, uint32_t timeout_ms);
 void gl868_modem_run_diagnostics(void);
