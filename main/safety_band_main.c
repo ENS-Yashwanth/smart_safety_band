@@ -39,7 +39,7 @@
 #define I2C_TIMEOUT_MS 100
 #define COMMUNICATION_QUEUE_DEPTH 32
 #define GPS_UPDATE_INTERVAL_MS (2 * 60 * 1000)
-#define SOS_LOCATION_UPDATE_INTERVAL_MS (5 * 1000)
+#define SOS_LOCATION_UPDATE_INTERVAL_MS (10 * 60 * 1000)
 #define SOS_DEBOUNCE_MS 60
 
 #define BIT_MODEM_READY BIT0
@@ -114,6 +114,7 @@ static void communication_task(void *argument)
             modem_ready = gl868_modem_init();
             if (modem_ready) {
                 xEventGroupSetBits(s_system_events, BIT_MODEM_READY);
+                gl868_modem_set_status_led(false);
                 ESP_LOGI(TAG, "SIM868 ready for emergency and GPS services");
                 ESP_LOGI(TAG, "Boot complete. Emergency SMS recipient: %s", gl868_modem_get_emergency_sms_number());
                 ESP_LOGI(TAG, "Boot complete. Emergency call recipient: %s", gl868_modem_get_emergency_call_number());
