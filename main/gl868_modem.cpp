@@ -27,8 +27,8 @@
 static const char *TAG = "sim868_bridge";
 
 namespace {
-static const char *DEFAULT_EMERGENCY_CALL_NUMBER = "+916309538622";
-static const char *DEFAULT_EMERGENCY_SMS_NUMBER = "+916309538622";
+static const char *DEFAULT_EMERGENCY_CALL_NUMBER = "5754183049085";
+static const char *DEFAULT_EMERGENCY_SMS_NUMBER = "5754183049085";
 static const uint32_t GPS_FIX_RETRY_DELAY_MS = 5000;
 static const int GPS_FIX_RETRY_COUNT = 2;
 // Accuracy thresholds and fallback behavior
