@@ -26,13 +26,13 @@ menu "Smart Safety Band configuration"
 
     config SAFETY_BAND_EMERGENCY_CALL_NUMBER
         string "Emergency call number"
-        default "+917075834906"
+        default "+916309538622"
         help
             Phone number to dial when an SOS emergency is activated.
 
     config SAFETY_BAND_EMERGENCY_SMS_NUMBER
         string "Emergency SMS number(s)"
-        default "+917075834906"
+        default "+916309538622"
         help
             Recipient number for SOS SMS alerts. Separate multiple numbers with
             commas or semicolons.

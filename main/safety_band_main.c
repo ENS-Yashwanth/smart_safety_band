@@ -8,6 +8,7 @@
 #include "driver/uart.h"
 #include "esp_err.h"
 #include "esp_log.h"
+#include "esp_sleep.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/event_groups.h"
 #include "freertos/queue.h"
@@ -99,6 +100,7 @@ static void init_io(void)
     }
     ESP_ERROR_CHECK(gpio_install_isr_service(0));
     ESP_ERROR_CHECK(gpio_isr_handler_add(SOS_BUTTON_GPIO, sos_isr, s_sos_sem));
+    ESP_ERROR_CHECK(esp_sleep_enable_ext0_wakeup(SOS_BUTTON_GPIO, s_sos_button_active_level));
 }
 
 /* The communication task is the only task that calls the modem API. This keeps
@@ -129,14 +131,13 @@ static void communication_task(void *argument)
         if (event.type == COMM_EVENT_EMERGENCY) {
             ESP_LOGW(TAG, "SOS emergency received from %s", event.source);
             s_sos_active = true;
-            /* Fast path for physical SOS button: dial immediately and skip
-             * GPS/SMS/HTTP work to achieve low latency call setup. */
-            if (event.source != NULL && strcmp(event.source, "SOS button") == 0) {
-                /* Use the emergency trigger (fast path) for SOS button */
-                gl868_modem_trigger_emergency(event.source);
-            } else {
-                gl868_modem_trigger_emergency(event.source);
+            if (!gl868_modem_register_network(45000)) {
+                ESP_LOGW(TAG, "GSM registration after SOS wake failed; continuing emergency attempt");
             }
+                gl868_modem_trigger_emergency(event.source);
+            gl868_modem_sleep();
+            s_sos_active = false;
+            gl868_modem_set_status_led(true);
         } else if (event.type == COMM_EVENT_GPS_UPLOAD) {
             if (!gl868_modem_upload_telemetry(event.source)) {
                 ESP_LOGW(TAG, "HTTP telemetry upload failed");
@@ -175,25 +176,40 @@ static void gps_task(void *argument)
     }
 }
 
-static __attribute__((unused)) void sos_button_task(void *argument)
+static void sos_button_task(void *argument)
 {
-    int last_level = gpio_get_level(SOS_BUTTON_GPIO);
-    TickType_t last_wake = xTaskGetTickCount();
-    const TickType_t period = pdMS_TO_TICKS(100);
+    (void)argument;
+    xEventGroupWaitBits(s_system_events, BIT_MODEM_READY, pdFALSE, pdTRUE, portMAX_DELAY);
     for (;;) {
-        int level = gpio_get_level(SOS_BUTTON_GPIO);
-        if (level != last_level) {
-            if (level == s_sos_button_active_level) {
-                ESP_LOGW(TAG, "SOS button became active (press detected)");
-                queue_communication_event(COMM_EVENT_EMERGENCY, "SOS button");
-            } else if (level == s_sos_button_idle_level) {
-                ESP_LOGI(TAG, "SOS button became idle (release detected)");
-            } else {
-                ESP_LOGI(TAG, "SOS button unusual level: %d", level);
-            }
-            last_level = level;
+        if (s_sos_active) {
+            vTaskDelay(pdMS_TO_TICKS(250));
+            continue;
         }
-        vTaskDelayUntil(&last_wake, period);
+
+        s_sos_button_last_level = gpio_get_level(SOS_BUTTON_GPIO);
+        if (s_sos_button_last_level == s_sos_button_active_level) {
+            vTaskDelay(pdMS_TO_TICKS(SOS_DEBOUNCE_MS));
+            continue;
+        }
+
+        ESP_LOGI(TAG, "Entering ESP32 light sleep; SIM868 modem is already sleeping");
+        esp_err_t sleep_error = esp_light_sleep_start();
+        if (sleep_error != ESP_OK) {
+            ESP_LOGW(TAG, "Light sleep failed: %s", esp_err_to_name(sleep_error));
+            vTaskDelay(pdMS_TO_TICKS(100));
+            continue;
+        }
+
+        if (gpio_get_level(SOS_BUTTON_GPIO) == s_sos_button_active_level) {
+            vTaskDelay(pdMS_TO_TICKS(SOS_DEBOUNCE_MS));
+            if (gpio_get_level(SOS_BUTTON_GPIO) == s_sos_button_active_level) {
+                ESP_LOGW(TAG, "SOS button woke device; requesting emergency response");
+                queue_communication_event(COMM_EVENT_EMERGENCY, "SOS button");
+                while (gpio_get_level(SOS_BUTTON_GPIO) == s_sos_button_active_level) {
+                    vTaskDelay(pdMS_TO_TICKS(20));
+                }
+            }
+        }
     }
 }
 
@@ -208,8 +224,5 @@ void app_main(void)
     ESP_LOGI(TAG, "Communication task started for modem UART access");
     xTaskCreate(sos_button_task, "sos_button", 2048, NULL, 8, NULL);
     ESP_LOGI(TAG, "SOS button task started on GPIO %d", SOS_BUTTON_GPIO);
-    xTaskCreate(gps_task, "gps_upload", 3072, NULL, 4, NULL);
-    ESP_LOGI(TAG, "GPS telemetry task started; uploads every 2 minutes");
-    xTaskCreate(sos_location_update_task, "sos_location", 3072, NULL, 4, NULL);
-    ESP_LOGI(TAG, "GPRS / SOS location update task started; uploads every 5 seconds while SOS is active");
+    ESP_LOGI(TAG, "Periodic modem/GPS uploads disabled; modem sleeps until SOS");
 }

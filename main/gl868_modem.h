@@ -5,6 +5,9 @@ extern "C" {
 #endif
 
 bool gl868_modem_init(void);
+bool gl868_modem_wake(void);
+bool gl868_modem_sleep(void);
+bool gl868_modem_register_network(uint32_t timeout_ms);
 void gl868_modem_update(void);
 void gl868_modem_set_status_led(bool gps_fix);
 void gl868_modem_trigger_emergency(const char *source);
@@ -19,6 +22,7 @@ bool gl868_modem_upload_telemetry(const char *event_type);
 bool gl868_modem_send_live_location(void);
 bool gl868_modem_get_gps_now(char *buf, size_t buf_len);
 bool gl868_modem_get_gps_coordinates(double *latitude, double *longitude);
+bool gl868_modem_has_gps_fix(void);
 const char *gl868_modem_get_emergency_call_number(void);
 const char *gl868_modem_get_emergency_sms_number(void);
 int gl868_modem_get_battery_percent(void);
