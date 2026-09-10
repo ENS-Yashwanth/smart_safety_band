@@ -45,6 +45,7 @@
 
 #define BIT_MODEM_READY BIT0
 #define BIT_EMERGENCY BIT1
+#define BIT_COMM_BUSY BIT2
 
 static const char *TAG = "SMART_SAFETY_BAND_001";
 
@@ -128,6 +129,7 @@ static void communication_task(void *argument)
         }
 
         if (xQueueReceive(s_communication_events, &event, portMAX_DELAY) != pdTRUE) continue;
+        xEventGroupSetBits(s_system_events, BIT_COMM_BUSY);
         if (event.type == COMM_EVENT_EMERGENCY) {
             ESP_LOGW(TAG, "SOS emergency received from %s", event.source);
             s_sos_active = true;
@@ -148,6 +150,7 @@ static void communication_task(void *argument)
                 ESP_LOGW(TAG, "Scheduled live location was not sent");
             }
         }
+        xEventGroupClearBits(s_system_events, BIT_COMM_BUSY);
     }
 }
 
@@ -180,9 +183,17 @@ static void sos_button_task(void *argument)
 {
     (void)argument;
     xEventGroupWaitBits(s_system_events, BIT_MODEM_READY, pdFALSE, pdTRUE, portMAX_DELAY);
+    /* Let modem initialization and console/UART activity settle before the
+     * first light-sleep transition. */
+    vTaskDelay(pdMS_TO_TICKS(1000));
     for (;;) {
         if (s_sos_active) {
             vTaskDelay(pdMS_TO_TICKS(250));
+            continue;
+        }
+
+        if ((xEventGroupGetBits(s_system_events) & BIT_COMM_BUSY) != 0) {
+            vTaskDelay(pdMS_TO_TICKS(100));
             continue;
         }
 
@@ -192,13 +203,17 @@ static void sos_button_task(void *argument)
             continue;
         }
 
+        gl868_modem_set_status_led(false);
         ESP_LOGI(TAG, "Entering ESP32 light sleep; SIM868 modem is already sleeping");
         esp_err_t sleep_error = esp_light_sleep_start();
         if (sleep_error != ESP_OK) {
             ESP_LOGW(TAG, "Light sleep failed: %s", esp_err_to_name(sleep_error));
+            gl868_modem_set_status_led(true);
             vTaskDelay(pdMS_TO_TICKS(100));
             continue;
         }
+
+        gl868_modem_set_status_led(true);
 
         if (gpio_get_level(SOS_BUTTON_GPIO) == s_sos_button_active_level) {
             vTaskDelay(pdMS_TO_TICKS(SOS_DEBOUNCE_MS));

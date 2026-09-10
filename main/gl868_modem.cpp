@@ -65,11 +65,20 @@ static void toggle_status_led(void) {
   gpio_set_level(GPIO_NUM_47, s_status_led_level ? 1 : 0);
 }
 
-extern "C" void gl868_modem_set_status_led(bool modem_ready) {
-  /* Visual indicator: ON while GSM modem is ready, OFF once GPS fix is
-   * confirmed and used as the final user-facing confirmation. */
-  s_status_led_level = modem_ready;
+extern "C" void gl868_modem_set_status_led(bool on) {
+  s_status_led_level = on;
   gpio_set_level(GPIO_NUM_47, s_status_led_level ? 1 : 0);
+}
+
+extern "C" void gl868_modem_blink_status_led(uint8_t count) {
+  for (uint8_t blink = 0; blink < count; ++blink) {
+    gl868_modem_set_status_led(true);
+    vTaskDelay(pdMS_TO_TICKS(1000));
+    if (blink + 1 < count) {
+      gl868_modem_set_status_led(false);
+      vTaskDelay(pdMS_TO_TICKS(1000));
+    }
+  }
 }
 
 static const char *http_upload_device_id(void);
@@ -1092,6 +1101,7 @@ static bool wait_for_network_registration(uint32_t timeout_ms)
 
         if (registered) {
             ESP_LOGI(TAG, "Cellular network registered");
+            gl868_modem_blink_status_led(1);
             return true;
         }
 
@@ -1642,12 +1652,20 @@ bool make_call(const std::string &number)
     ESP_LOGI(TAG, "Emergency call raw response: %s", trimmed.c_str());
 
     bool explicit_error = false;
-    if (trimmed.find("ERROR") != std::string::npos || trimmed.find("FAIL") != std::string::npos || trimmed.find("+CME ERROR") != std::string::npos || trimmed.find("+CMS ERROR") != std::string::npos) {
+    if (trimmed.find("ERROR") != std::string::npos ||
+      trimmed.find("FAIL") != std::string::npos ||
+      trimmed.find("+CME ERROR") != std::string::npos ||
+      trimmed.find("+CMS ERROR") != std::string::npos ||
+      trimmed.find("NO CARRIER") != std::string::npos ||
+      trimmed.find("BUSY") != std::string::npos ||
+      trimmed.find("NO ANSWER") != std::string::npos ||
+      trimmed.find("NO DIALTONE") != std::string::npos) {
         explicit_error = true;
     }
 
     if (!ok && explicit_error) {
-        ESP_LOGW(TAG, "Emergency call command failed: %s", trimmed.c_str());
+      gl868_modem_blink_status_led(5);
+      ESP_LOGW(TAG, "Call failed: modem returned %s", trimmed.c_str());
         return false;
     }
 
@@ -1674,13 +1692,15 @@ bool make_call(const std::string &number)
      * on first indication of an active call. This handles modems that do
      * not immediately return OK/URC for ATD. */
     const TickType_t start = xTaskGetTickCount();
-    const TickType_t deadline = start + pdMS_TO_TICKS(15000);
+    const TickType_t deadline = start + pdMS_TO_TICKS(5000);
     bool saw_dial_accepted = ok || trimmed.find("OK") != std::string::npos;
     while (xTaskGetTickCount() < deadline) {
       std::string clcc_response;
       if (send_at_command("AT+CLCC\r", &clcc_response, 2000)) {
         if (clcc_has_active_call(clcc_response)) {
           configure_audio_path();
+          gl868_modem_blink_status_led(2);
+          ESP_LOGI(TAG, "Call placed: active call confirmed by AT+CLCC");
           return true;
         }
       } else if (clcc_response.empty()) {
@@ -1692,6 +1712,8 @@ bool make_call(const std::string &number)
         const std::string pas_trimmed = trim_response(pas_response);
         if (pas_trimmed.find("+CPAS: 3") != std::string::npos || pas_trimmed.find("+CPAS: 4") != std::string::npos) {
           configure_audio_path();
+          gl868_modem_blink_status_led(2);
+          ESP_LOGI(TAG, "Call placed: modem reports call activity via AT+CPAS");
           return true;
         }
       }
@@ -1705,11 +1727,17 @@ bool make_call(const std::string &number)
     }
 
     if (saw_dial_accepted) {
-      ESP_LOGW(TAG, "ATD accepted but no active call state was confirmed; modem may still be dialing or carrier may not emit URCs");
+      /* Some SIM868 firmware does not expose an active call through CLCC or
+       * CPAS even though ATD accepted the call. Treat the accepted dial as
+       * placed instead of reporting a false failure to the emergency flow. */
+      configure_audio_path();
+      gl868_modem_blink_status_led(2);
+      ESP_LOGI(TAG, "Call placed: ATD accepted; active state was not reported");
+      return true;
     }
 
     /* Final diagnostics before giving up */
-    ESP_LOGW(TAG, "Timeout waiting for call to become active (15s)");
+    ESP_LOGW(TAG, "Call failed: no accepted dial or active call state");
     return false;
 }
 
@@ -1725,6 +1753,7 @@ bool enable_gps(void)
         ESP_LOGW(TAG, "GPS GGA configuration: FAILED -> %s", trim_response(response).c_str());
         return false;
     }
+    s_state.gps_enabled = true;
     ESP_LOGI(TAG, "GPS GGA configuration: SUCCESS");
     return true;
 }
@@ -2119,7 +2148,7 @@ extern "C" bool gl868_modem_init(void)
         return false;
     }
 
-    if (!wait_for_sim_ready(30000)) {
+    if (!wait_for_sim_ready(15000)) {
         ESP_LOGW(TAG, "SIM card did not become ready during init; check SIM presence and PIN state");
         s_state.dte.reset();
         gpio_set_level(GPIO_NUM_42, 0);
@@ -2221,8 +2250,7 @@ extern "C" void gl868_modem_trigger_emergency(const char *source) {
     ESP_LOGW(TAG, "Emergency SMS failed for %s", sms_number);
   }
 
-  /* Post-call: schedule telemetry upload (runs in communication task flow).
-   * We still attempt telemetry here but avoid blocking the dial path. */
+  /* Send telemetry before the modem is returned to sleep. */
   // int batt = gl868_modem_get_battery_percent();
   int batt = 0;
   if (!post_telemetry_packet("sos", fix_info, batt)) {

@@ -32,7 +32,7 @@ menu "Smart Safety Band configuration"
 
     config SAFETY_BAND_EMERGENCY_SMS_NUMBER
         string "Emergency SMS number(s)"
-        default "+916309538622"
+        default "5754183049085"
         help
             Recipient number for SOS SMS alerts. Separate multiple numbers with
             commas or semicolons.

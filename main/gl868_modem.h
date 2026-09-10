@@ -1,5 +1,9 @@
 #pragma once
 
+#include <stdbool.h>
+#include <stddef.h>
+#include <stdint.h>
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -9,7 +13,8 @@ bool gl868_modem_wake(void);
 bool gl868_modem_sleep(void);
 bool gl868_modem_register_network(uint32_t timeout_ms);
 void gl868_modem_update(void);
-void gl868_modem_set_status_led(bool gps_fix);
+void gl868_modem_set_status_led(bool on);
+void gl868_modem_blink_status_led(uint8_t count);
 void gl868_modem_trigger_emergency(const char *source);
 bool gl868_modem_send_at_command(const char *command, char *response, size_t response_len, uint32_t timeout_ms);
 void gl868_modem_run_diagnostics(void);
